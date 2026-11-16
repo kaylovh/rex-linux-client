@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Rexa
+GenericName=Rex Client
+Comment=Sessions, tabs and panes of your Rex servers
+Exec=@BIN@/rexa-app
+Icon=rexa
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=rex;terminal;tmux;session;claude;
+StartupWMClass=dev.rexa.Rexa
+StartupNotify=true

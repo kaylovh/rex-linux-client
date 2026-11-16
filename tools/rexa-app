@@ -1,0 +1,36 @@
+#!/bin/sh
+# Rexa in a window of its own: a dedicated terminal window (Ghostty when installed) with
+# its own app id, title and icon, running rexa. Closing the window only detaches — every
+# program keeps running in Rex. Arguments go to rexa (e.g. `rexa-app attach work`).
+set -u
+here=$(dirname "$(readlink -f "$0")")
+rexa="$here/rexa"
+[ -x "$rexa" ] || rexa=$(command -v rexa) || { echo "rexa-app: rexa not found" >&2; exit 1; }
+app_id=dev.rexa.Rexa
+
+# Keep the window open when rexa fails (no server, wrong host…), so the error can be read.
+run='"$0" "$@"; s=$?; if [ $s -ne 0 ]; then printf "\nrexa exited (%s). Press Enter to close." "$s"; read _; fi'
+
+if command -v ghostty >/dev/null 2>&1; then
+  # mouse-shift-capture: Shift+mouse goes to rexa (its selection / menu) instead of Ghostty
+  exec ghostty --class="$app_id" --title=Rexa --gtk-single-instance=false \
+    --confirm-close-surface=false --window-save-state=never \
+    --quit-after-last-window-closed=true --mouse-shift-capture=always \
+    -e sh -c "$run" "$rexa" "$@"
+elif command -v kitty >/dev/null 2>&1; then
+  exec kitty --class "$app_id" -T Rexa sh -c "$run" "$rexa" "$@"
+elif command -v foot >/dev/null 2>&1; then
+  exec foot --app-id="$app_id" --title=Rexa sh -c "$run" "$rexa" "$@"
+elif command -v alacritty >/dev/null 2>&1; then
+  exec alacritty --class "$app_id" -T Rexa -e sh -c "$run" "$rexa" "$@"
+elif command -v wezterm >/dev/null 2>&1; then
+  exec wezterm start --class "$app_id" -- sh -c "$run" "$rexa" "$@"
+elif command -v gnome-terminal >/dev/null 2>&1; then
+  exec gnome-terminal --class="$app_id" --title=Rexa -- sh -c "$run" "$rexa" "$@"
+elif command -v konsole >/dev/null 2>&1; then
+  exec konsole -e sh -c "$run" "$rexa" "$@"
+elif command -v xterm >/dev/null 2>&1; then
+  exec xterm -class "$app_id" -T Rexa -e sh -c "$run" "$rexa" "$@"
+fi
+echo "rexa-app: no terminal found (install Ghostty)" >&2
+exit 1

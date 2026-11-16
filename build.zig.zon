@@ -1,0 +1,17 @@
+.{
+    .name = .rexa,
+    .version = "0.1.0",
+    .fingerprint = 0x733d1cf08d737ffc,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .ghostty = .{
+            .url = "git+https://github.com/ghostty-org/ghostty#7fa26e8b675f3248975479d88274c937d7e63905",
+            .hash = "ghostty-1.4.1-dev-5UdBC5uMpgUYOQqmFJzd5xUAFfkvoSOlCtNlD_RqGT9A",
+        },
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis?ref=main#25b4bd7371cc3c32049e103ab292a525a1ecb7a7",
+            .hash = "vaxis-0.6.0-BWNV_G8gDgCNWI48cFKWal2NROjTRQXumw3ssMDeD6jt",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

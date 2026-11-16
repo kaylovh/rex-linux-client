@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#26323f"/>
+      <stop offset="1" stop-color="#141a21"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="url(#bg)"/>
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="none" stroke="#3aa0ff" stroke-opacity=".55" stroke-width="3"/>
+  <!-- tab bar -->
+  <rect x="22" y="22" width="30" height="9" rx="3" fill="#1f7fd1"/>
+  <rect x="56" y="22" width="22" height="9" rx="3" fill="#3a4654"/>
+  <!-- split -->
+  <line x1="74" y1="40" x2="74" y2="106" stroke="#3aa0ff" stroke-width="3"/>
+  <line x1="74" y1="73" x2="106" y2="73" stroke="#4a5868" stroke-width="3"/>
+  <!-- prompt -->
+  <path d="M26 52 L40 63 L26 74" fill="none" stroke="#e8edf2" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <line x1="45" y1="76" x2="64" y2="76" stroke="#ffb02e" stroke-width="7" stroke-linecap="round"/>
+  <!-- status dots -->
+  <circle cx="90" cy="56" r="5" fill="#5fd787"/>
+  <circle cx="90" cy="90" r="5" fill="#ff875f"/>
+</svg>
