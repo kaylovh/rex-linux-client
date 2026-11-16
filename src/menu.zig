@@ -50,6 +50,8 @@ pub const Action = enum {
     confirm_delete_machine,
     delete_machine,
     add_machine,
+    /// one of the server's `rex hosts`: take it off the machine list
+    hide_machine,
 };
 
 pub const Menu = struct {

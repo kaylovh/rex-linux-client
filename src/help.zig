@@ -65,6 +65,7 @@ pub const sections = [_]Section{
         .{ "+", "new tab / session / machine", "新建 tab / session / 机器" },
         .{ "Shift + mouse", "if the program uses the mouse (vim…)", "程序自己用鼠标时(vim、htop…)," },
         .{ "", "Shift gets rexa's selection, menus", "按住 Shift 用 rexa 的选中和右键菜单" },
+        .{ "", "(or Settings: dragging always selects)", "(或设置里打开「拖动总是选文字」)" },
     } },
 };
 

@@ -80,6 +80,8 @@ Mouse:
   the palette and settings take clicks too
 - when the program uses the mouse itself (vim, htop…), clicks go to it; hold Shift for
   rexa's selection and menus
+  (or turn on **Dragging always selects text** in Settings → General: then a plain drag
+  selects even there, a click still goes to the program, and Shift-drag hands the drag to it)
 
 Clipboard: **Ctrl-V with an image on the clipboard** uploads it to the pane's machine and
 pastes its path — that is how screenshots reach Claude Code, local or remote. Files dropped on
@@ -90,10 +92,15 @@ the terminal are uploaded the same way when the server is remote. Copies made by
 
 Saved in `~/.config/rexa/config.json` (`$XDG_CONFIG_HOME/rexa/`). `Tab` or `1` `2` `3` switch pages.
 
-- **General**: the language, 中文 or English (the first time it follows `$LANG`). Applies at once.
+- **General**: the language, 中文 or English (the first time it follows `$LANG`), and the mouse
+  switch "Dragging always selects text". Both apply at once.
 - **Machines**: this computer and your remote machines, each with a nickname you choose.
-  `a` add (address, then name), `r` rename, `e` edit the address, `d` delete, `Enter` connect;
-  machines from `rex hosts` are listed too and `s` saves one under a name. The sidebar shows the
+  `a` add (address, then name), `r` rename, `e` edit the address, `d` delete, `Enter` connect.
+  Below them, **rex hosts on <the connected machine>**: that server's own list of machines.
+  `Space` shows one in the machine list or hides it (also "Hide from the list" in its right-click
+  menu), `s` saves it under a name. On this computer they are all shown until you choose; on a
+  remote machine none are, so a Mac that itself connects back here doesn't nest. Over ssh such a
+  host is reached through that machine (`ssh://me@mac#<its address there>`). The sidebar shows the
   same list: the current machine opens into its sessions, a click on another one switches to it,
   right-click for its menu. If a machine can't be reached, rexa goes back to the one you were on
   and says why.

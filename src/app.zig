@@ -119,6 +119,9 @@ pub const App = struct {
     sel_block: ?[]u8 = null,
     sel_anchor: [2]u16 = .{ 0, 0 },
     sel_moved: bool = false,
+    /// the selection began on a program that wants the mouse ("drag always selects"):
+    /// a click without a drag still goes to the program
+    sel_click_through: bool = false,
     /// Ctrl-b Space : command palette over the window area
     palette: ?palette_mod.Palette = null,
     /// Settings (Ctrl-b S, ⚙): replaces the window area
@@ -763,6 +766,9 @@ pub const App = struct {
             }
             return;
         }
+        // The kitty protocol reports a lone Shift/Ctrl/Alt press too; rexa's own keys
+        // (Ctrl-b then Shift-5, menus, prompts…) must wait for the real key.
+        if (k.isModifier() and (self.prefix or self.help != null or self.menu != null or self.palette != null or self.scroll_mode or self.settings != null)) return;
         if (self.prefix) {
             self.prefix = false;
             self.prefixCommand(k);
@@ -1035,17 +1041,41 @@ pub const App = struct {
             .server => if (self.panel != null) self.panelKey(k),
             .general => switch (k.codepoint) {
                 vaxis.Key.escape, 'q' => self.closeSettings(),
-                vaxis.Key.left, vaxis.Key.right, vaxis.Key.enter, ' ', 'h', 'l' => self.setLang(if (i18n.lang == .zh) .en else .zh),
+                vaxis.Key.up, 'k' => st.gsel = 0,
+                vaxis.Key.down, 'j' => st.gsel = 1,
+                vaxis.Key.left, vaxis.Key.right, vaxis.Key.enter, ' ', 'h', 'l' => if (st.gsel == 0) self.setLang(if (i18n.lang == .zh) .en else .zh) else self.toggleDragSelects(),
                 else => if (k.matches('c', .{ .ctrl = true }) or k.matches('g', .{ .ctrl = true })) self.closeSettings(),
             },
             .machines => {
                 const ms = self.machines(self.frame.allocator());
-                if (st.sel >= ms.len) st.sel = ms.len -| 1;
+                const hs = self.hostRows(self.frame.allocator());
+                if (st.sel >= ms.len + hs.len) st.sel = ms.len + hs.len -| 1;
+                if (st.sel >= ms.len) {
+                    const h = hs[st.sel - ms.len];
+                    switch (k.codepoint) {
+                        ' ' => self.toggleHost(h.name),
+                        vaxis.Key.enter => self.switchMachine(h.spec),
+                        's' => {
+                            var p: palette_mod.Palette = .init(self.gpa);
+                            p.startPrompt(tr("name:", "名字:"), "machine_name", h.name);
+                            p.target = p.arena.allocator().dupe(u8, h.spec) catch "";
+                            self.openPrompt(p);
+                        },
+                        'a' => self.machineDo(.add_machine, "", 0, 0),
+                        vaxis.Key.escape, 'q' => self.closeSettings(),
+                        vaxis.Key.up, 'k' => st.sel -|= 1,
+                        vaxis.Key.down, 'j' => if (st.sel + 1 < ms.len + hs.len) {
+                            st.sel += 1;
+                        },
+                        else => if (k.matches('c', .{ .ctrl = true }) or k.matches('g', .{ .ctrl = true })) self.closeSettings(),
+                    }
+                    return;
+                }
                 const m = ms[st.sel];
                 switch (k.codepoint) {
                     vaxis.Key.escape, 'q' => self.closeSettings(),
                     vaxis.Key.up, 'k' => st.sel -|= 1,
-                    vaxis.Key.down, 'j' => if (st.sel + 1 < ms.len) {
+                    vaxis.Key.down, 'j' => if (st.sel + 1 < ms.len + hs.len) {
                         st.sel += 1;
                     },
                     vaxis.Key.enter => self.machineDo(.connect_machine, m.spec, 0, 0),
@@ -1058,6 +1088,11 @@ pub const App = struct {
                 }
             },
         }
+    }
+
+    fn toggleDragSelects(self: *App) void {
+        self.config.setDragSelects(!self.config.drag_selects);
+        if (self.config.save_error) |e| self.say("couldn't save the settings: {s}", "设置保存失败:{s}", .{e});
     }
 
     fn setLang(self: *App, l: i18n.Lang) void {
@@ -1073,14 +1108,48 @@ pub const App = struct {
         for (self.config.servers.items, 0..) |sv, i| {
             list.append(arena, .{ .name = sv.name, .spec = sv.endpoint, .source = .saved, .index = i, .current = std.mem.eql(u8, sv.endpoint, self.spec) }) catch {};
         }
-        for (self.hosts.items) |h| {
-            if (self.config.find(h.endpoint) != null or self.config.find(h.label) != null) continue;
-            const cur = std.mem.eql(u8, h.endpoint, self.spec) or std.mem.eql(u8, h.label, self.spec);
-            list.append(arena, .{ .name = h.label, .spec = h.endpoint, .source = .rex_host, .current = cur }) catch {};
+        for (self.hostRows(arena)) |h| {
+            if (!h.shown) continue;
+            list.append(arena, .{ .name = h.name, .spec = h.spec, .source = .rex_host, .current = h.current }) catch {};
         }
         for (list.items) |m| if (m.current) return list.items;
         list.append(arena, .{ .name = config_mod.defaultName(self.spec), .spec = self.spec, .source = .adhoc, .current = true }) catch {};
         return list.items;
+    }
+
+    /// The connected server's `rex hosts` (minus the ones saved here), whether each is
+    /// shown in the machine list. Over ssh a host is reached through that machine
+    /// (ssh://…#its address there): its addresses are that machine's, not ours.
+    fn hostRows(self: *App, arena: std.mem.Allocator) []settings_mod.HostRow {
+        var list: std.ArrayList(settings_mod.HostRow) = .empty;
+        const chosen = self.config.shownHosts(self.spec);
+        const via_ssh = std.mem.startsWith(u8, self.spec, "ssh://") and std.mem.indexOfScalar(u8, self.spec, '#') == null;
+        for (self.hosts.items) |h| {
+            const spec = if (via_ssh)
+                std.fmt.allocPrint(arena, "{s}#{s}", .{ std.mem.trimEnd(u8, self.spec, "/"), h.endpoint }) catch continue
+            else
+                h.endpoint;
+            if (self.config.find(spec) != null or self.config.find(h.endpoint) != null or self.config.find(h.label) != null) continue;
+            const shown = if (chosen) |c| for (c) |l| {
+                if (std.mem.eql(u8, l, h.label)) break true;
+            } else false else self.spec.len == 0;
+            const cur = std.mem.eql(u8, spec, self.spec) or std.mem.eql(u8, h.label, self.spec);
+            list.append(arena, .{ .name = h.label, .spec = spec, .shown = shown, .current = cur }) catch {};
+        }
+        return list.items;
+    }
+
+    /// Shows or hides one of the connected server's hosts in the machine list.
+    fn toggleHost(self: *App, label: []const u8) void {
+        const arena = self.frame.allocator();
+        var visible: std.ArrayList([]const u8) = .empty;
+        var on = true;
+        for (self.hostRows(arena)) |h| if (h.shown) {
+            if (std.mem.eql(u8, h.name, label)) on = false;
+            visible.append(arena, h.name) catch return;
+        };
+        self.config.setHostShown(self.spec, label, on, visible.items);
+        if (self.config.save_error) |e| self.say("couldn't save the settings: {s}", "设置保存失败:{s}", .{e});
     }
 
     fn currentMachineName(self: *App, arena: std.mem.Allocator) []const u8 {
@@ -1113,6 +1182,7 @@ pub const App = struct {
             .rex_host, .adhoc => mn.add(tr("Save with a name…", "保存并命名…"), "", .save_machine),
             .local => {},
         }
+        if (m.source == .rex_host) mn.add(tr("Hide from the list", "从列表里隐藏"), "", .hide_machine);
         mn.separator();
         mn.add(tr("Add a machine…", "添加机器…"), "", .add_machine);
         mn.add(tr("Manage machines…", "管理机器…"), "Ctrl-b S", .settings);
@@ -1155,6 +1225,9 @@ pub const App = struct {
                 mn.add(tr("Cancel", "取消"), "Esc", .none);
                 mn.sel = 0;
                 self.openMenu(mn);
+            },
+            .hide_machine => for (self.hostRows(arena)) |h| {
+                if (std.mem.eql(u8, h.spec, spec) and h.shown) break self.toggleHost(h.name);
             },
             .delete_machine => if (self.config.find(spec)) |i| {
                 self.config.remove(i);
@@ -1392,7 +1465,14 @@ pub const App = struct {
                     st.page = pg;
                     self.settingsPageShown();
                 },
-                .lang => |l| self.setLang(l),
+                .lang => |l| {
+                    st.gsel = 0;
+                    self.setLang(l);
+                },
+                .drag_select => {
+                    st.gsel = 1;
+                    self.toggleDragSelects();
+                },
                 .machine => |i| {
                     st.sel = i;
                     if (clicks >= 2) self.settingsKey(.{ .codepoint = vaxis.Key.enter });
@@ -1424,24 +1504,43 @@ pub const App = struct {
         const cy = ly - p.content.y;
         const pane = self.panes.get(p.block_id);
         // The program gets the mouse when it asks for it; Shift keeps it for rexa.
-        const local_mouse = pane != null and (m.mods.shift or !pane.?.programWantsMouse());
+        const wants = pane != null and pane.?.programWantsMouse();
+        const local_mouse = pane != null and (m.mods.shift or !wants);
+        // "drag always selects": a plain left drag selects, Shift gives it to the program
+        const drag_sel = wants and self.config.drag_selects and !m.mods.shift;
         switch (m.button) {
             .left => switch (m.type) {
                 .press => {
                     self.focusBlock(p.block_id);
                     self.endSelection(false);
-                    if (local_mouse) {
+                    if (drag_sel) {
+                        self.sel_block = self.gpa.dupe(u8, p.block_id) catch null;
+                        self.sel_anchor = .{ cx, cy };
+                        self.sel_moved = false;
+                        self.sel_click_through = true;
+                    } else if (local_mouse and !(wants and self.config.drag_selects)) {
                         if (clicks >= 2) return self.selectWord(pane.?, p.content, cx, cy, clicks >= 3);
                         self.sel_block = self.gpa.dupe(u8, p.block_id) catch null;
                         self.sel_anchor = .{ cx, cy };
                         self.sel_moved = false;
+                        self.sel_click_through = false;
                     } else self.forwardButton(p.block_id, "press", "left", cx, cy, m.mods);
                 },
                 .drag => if (self.sel_block) |sb| if (std.mem.eql(u8, sb, p.block_id)) {
                     pane.?.select(self.sel_anchor[0], self.sel_anchor[1], cx, cy);
                     self.sel_moved = true;
                 },
-                .release => if (self.sel_block != null) self.endSelection(true) else if (!local_mouse) self.forwardButton(p.block_id, "release", "left", cx, cy, m.mods),
+                .release => if (self.sel_block != null) {
+                    if (self.sel_click_through and !self.sel_moved) {
+                        // just a click: the program gets it after all
+                        const bid = self.gpa.dupe(u8, self.sel_block.?) catch return self.endSelection(false);
+                        defer self.gpa.free(bid);
+                        const ax, const ay = self.sel_anchor;
+                        self.endSelection(false);
+                        self.forwardButton(bid, "press", "left", ax, ay, m.mods);
+                        self.forwardButton(bid, "release", "left", ax, ay, m.mods);
+                    } else self.endSelection(true);
+                } else if (!local_mouse or (wants and self.config.drag_selects)) self.forwardButton(p.block_id, "release", "left", cx, cy, m.mods),
                 else => {},
             },
             .wheel_up, .wheel_down, .wheel_left, .wheel_right => if (m.type == .press) {
@@ -1781,7 +1880,7 @@ pub const App = struct {
             .toggle_sidebar => self.sidebar = !self.sidebarShown(),
             .detach => self.exitWith("detached", "已断开(程序继续在 Rex 里运行)"),
             .exit_scroll => self.scrollKey(.{ .codepoint = 'q' }),
-            .connect_machine, .rename_machine, .edit_machine, .save_machine, .confirm_delete_machine, .delete_machine, .add_machine => {
+            .connect_machine, .rename_machine, .edit_machine, .save_machine, .confirm_delete_machine, .delete_machine, .add_machine, .hide_machine => {
                 const spec = if (std.mem.startsWith(u8, target, "machine:")) target["machine:".len..] else "";
                 self.machineDo(action, spec, mx, my);
             },
@@ -1898,7 +1997,7 @@ pub const App = struct {
 
         var keep: std.ArrayList([]const u8) = .empty;
         if (self.settings) |*st| {
-            const content = st.draw(area, arena, self.machines(arena), self.config.path, self.config.save_error);
+            const content = st.draw(area, arena, self.machines(arena), self.hostRows(arena), self.currentMachineName(arena), self.config.path, self.config.save_error, self.config.drag_selects);
             if (st.page == .server) if (self.panel) |*p| p.draw(content, arena, self.currentMachineName(arena));
             // keep the panes alive behind the panel
             var it = self.panes.keyIterator();

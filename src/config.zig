@@ -1,12 +1,17 @@
 //! rexa's settings, kept in $XDG_CONFIG_HOME/rexa/config.json (~/.config/rexa/...):
 //! the language and the saved machines (a nickname and an address each).
 //!
-//!   {"language":"zh","servers":[{"name":"MacBook","endpoint":"ssh://me@mac.local"}]}
+//!   {"language":"zh","servers":[{"name":"MacBook","endpoint":"ssh://me@mac.local"}],
+//!    "shown_hosts":[{"server":"ssh://me@mac.local","hosts":["studio"]}]}
+//!
+//! shown_hosts: which of a server's own `rex hosts` the machine list shows. A server
+//! with no entry: all of them for this computer (""), none for a remote one.
 
 const std = @import("std");
 const i18n = @import("i18n.zig");
 
 pub const Server = struct { name: []const u8, endpoint: []const u8 };
+pub const Shown = struct { server: []const u8, hosts: []const []const u8 };
 
 pub const Config = struct {
     gpa: std.mem.Allocator,
@@ -15,13 +20,18 @@ pub const Config = struct {
     arena: std.heap.ArenaAllocator,
     path: []const u8 = "",
     lang: i18n.Lang = .en,
+    /// a plain drag selects text even when the program wants the mouse (Shift gives it the drag)
+    drag_selects: bool = false,
     servers: std.ArrayList(Server) = .empty,
+    shown: std.ArrayList(Shown) = .empty,
     /// the last save failed: why
     save_error: ?[]const u8 = null,
 
     const File = struct {
         language: ?[]const u8 = null,
+        drag_selects: bool = false,
         servers: []const Server = &.{},
+        shown_hosts: []const Shown = &.{},
     };
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) Config {
@@ -38,15 +48,18 @@ pub const Config = struct {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, c.path, a, .limited(1024 * 1024)) catch return c;
         const parsed = std.json.parseFromSliceLeaky(File, a, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return c;
         if (parsed.language) |l| c.lang = i18n.parse(l) orelse c.lang;
+        c.drag_selects = parsed.drag_selects;
         for (parsed.servers) |s| {
             if (s.endpoint.len == 0) continue;
             c.servers.append(gpa, s) catch {};
         }
+        for (parsed.shown_hosts) |s| c.shown.append(gpa, s) catch {};
         return c;
     }
 
     pub fn deinit(self: *Config) void {
         self.servers.deinit(self.gpa);
+        self.shown.deinit(self.gpa);
         self.arena.deinit();
     }
 
@@ -56,7 +69,7 @@ pub const Config = struct {
             self.save_error = "no $HOME";
             return false;
         }
-        const out: File = .{ .language = @tagName(self.lang), .servers = self.servers.items };
+        const out: File = .{ .language = @tagName(self.lang), .drag_selects = self.drag_selects, .servers = self.servers.items, .shown_hosts = self.shown.items };
         const bytes = std.json.Stringify.valueAlloc(self.gpa, out, .{ .whitespace = .indent_2 }) catch return false;
         defer self.gpa.free(bytes);
         const dir = std.fs.path.dirname(self.path) orelse ".";
@@ -111,6 +124,33 @@ pub const Config = struct {
         _ = self.save();
     }
 
+    /// The `rex hosts` labels chosen for `server`; null: never chosen (the default applies).
+    pub fn shownHosts(self: *const Config, server: []const u8) ?[]const []const u8 {
+        for (self.shown.items) |s| if (std.mem.eql(u8, s.server, server)) return s.hosts;
+        return null;
+    }
+
+    /// Shows or hides one of `server`'s hosts. `visible`: the labels shown now (the
+    /// default, when nothing was chosen yet).
+    pub fn setHostShown(self: *Config, server: []const u8, label: []const u8, on: bool, visible: []const []const u8) void {
+        const a = self.arena.allocator();
+        var list: std.ArrayList([]const u8) = .empty;
+        for (visible) |l| if (!std.mem.eql(u8, l, label)) list.append(a, a.dupe(u8, l) catch return) catch return;
+        if (on) list.append(a, a.dupe(u8, label) catch return) catch return;
+        for (self.shown.items) |*s| if (std.mem.eql(u8, s.server, server)) {
+            s.hosts = list.items;
+            _ = self.save();
+            return;
+        };
+        self.shown.append(self.gpa, .{ .server = a.dupe(u8, server) catch return, .hosts = list.items }) catch return;
+        _ = self.save();
+    }
+
+    pub fn setDragSelects(self: *Config, on: bool) void {
+        self.drag_selects = on;
+        _ = self.save();
+    }
+
     pub fn setLang(self: *Config, l: i18n.Lang) void {
         self.lang = l;
         i18n.lang = l;
@@ -122,6 +162,10 @@ pub const Config = struct {
 /// or the address itself.
 pub fn defaultName(endpoint: []const u8) []const u8 {
     var s = endpoint;
+    // ssh://mac#unix:///x/p1.sock: that server, reached through mac
+    if (std.mem.startsWith(u8, s, "ssh://")) if (std.mem.indexOfScalar(u8, s, '#')) |i| {
+        if (i + 1 < s.len) return defaultName(s[i + 1 ..]);
+    };
     if (std.mem.startsWith(u8, s, "unix://")) return std.fs.path.basename(s);
     if (std.mem.indexOf(u8, s, "://")) |i| s = s[i + 3 ..];
     if (std.mem.lastIndexOfScalar(u8, s, '@')) |i| s = s[i + 1 ..];
@@ -137,6 +181,7 @@ test "default names" {
     try std.testing.expectEqualStrings("mac", defaultName("ssh://me@mac.local"));
     try std.testing.expectEqualStrings("box", defaultName("ssh://box:2222"));
     try std.testing.expectEqualStrings("studio", defaultName("studio"));
+    try std.testing.expectEqualStrings("p1.sock", defaultName("ssh://me@mac#unix:///x/p1.sock"));
 }
 
 test "save and load" {
@@ -162,4 +207,13 @@ test "save and load" {
     try std.testing.expectEqual(i18n.Lang.en, c.lang);
     try std.testing.expectEqual(@as(usize, 1), c.servers.items.len);
     try std.testing.expectEqualStrings("Mac", c.servers.items[0].name);
+    try std.testing.expect(c.shownHosts("ssh://me@mac.local") == null);
+    c.setHostShown("ssh://me@mac.local", "studio", true, &.{});
+    c.setHostShown("ssh://me@mac.local", "P1", true, c.shownHosts("ssh://me@mac.local").?);
+    c.setHostShown("ssh://me@mac.local", "studio", false, c.shownHosts("ssh://me@mac.local").?);
+    var c2 = Config.load(std.testing.allocator, io, &env);
+    defer c2.deinit();
+    const shown = c2.shownHosts("ssh://me@mac.local").?;
+    try std.testing.expectEqual(@as(usize, 1), shown.len);
+    try std.testing.expectEqualStrings("P1", shown[0]);
 }

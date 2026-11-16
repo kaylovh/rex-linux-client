@@ -10,7 +10,8 @@ pub const Endpoint = union(enum) {
     /// argv of a stdio bridge command
     command: []const []const u8,
 
-    /// unix:///path, /path, ssh://[user@]host[:port], cmd:<argv words>
+    /// unix:///path, /path, ssh://[user@]host[:port][#address], cmd:<argv words>
+    /// (#address: a Rex server as that machine reaches it, e.g. one of its `rex hosts`)
     pub fn parse(arena: std.mem.Allocator, s: []const u8) !Endpoint {
         if (std.mem.startsWith(u8, s, "unix://")) return .{ .unix = s["unix://".len..] };
         if (std.mem.startsWith(u8, s, "/")) return .{ .unix = s };
@@ -23,6 +24,12 @@ pub const Endpoint = union(enum) {
         }
         if (std.mem.startsWith(u8, s, "ssh://")) {
             var rest = std.mem.trimEnd(u8, s["ssh://".len..], "/");
+            var hop: []const u8 = "";
+            if (std.mem.indexOfScalar(u8, rest, '#')) |i| {
+                hop = rest[i + 1 ..];
+                rest = std.mem.trimEnd(u8, rest[0..i], "/");
+            }
+            if (rest.len == 0) return error.BadEndpoint;
             var argv: std.ArrayList([]const u8) = .empty;
             try argv.appendSlice(arena, &.{ "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15" });
             if (std.mem.lastIndexOfScalar(u8, rest, ':')) |i| {
@@ -35,7 +42,7 @@ pub const Endpoint = union(enum) {
             try argv.append(arena, rest);
             // The remote shell runs this. A non-interactive ssh shell often lacks the PATH
             // set up in .zprofile/.bashrc (Homebrew on a Mac), so add the usual places.
-            try argv.append(arena, remote_cmd);
+            try argv.append(arena, if (hop.len == 0) remote_cmd else try std.fmt.allocPrint(arena, remote_path ++ "exec rex --server {s} __internal dial-stdio", .{try shellQuote(arena, hop)}));
             return .{ .command = argv.items };
         }
         if (s.len == 0) return error.BadEndpoint;
@@ -48,6 +55,15 @@ pub const Endpoint = union(enum) {
     /// Put in front of a remote command so a non-interactive ssh shell finds rex.
     pub const remote_path = "PATH=\"$PATH:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/Applications/Rex.app/Contents/MacOS:/Applications/Rex.app/Contents/Resources\"; export PATH; ";
     pub const remote_cmd = remote_path ++ "exec rex __internal dial-stdio";
+
+    /// it's -> 'it'\''s', for the remote shell
+    fn shellQuote(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.append(arena, '\'');
+        for (s) |c| if (c == '\'') try out.appendSlice(arena, "'\\''") else try out.append(arena, c);
+        try out.append(arena, '\'');
+        return out.items;
+    }
 
     pub fn defaultLocal(arena: std.mem.Allocator, env: *const std.process.Environ.Map) !Endpoint {
         if (env.get("REX_SERVER")) |s| {
@@ -173,4 +189,7 @@ test "parse endpoints" {
     try std.testing.expectEqual(@as(usize, 3), cmd.len);
     const label = (try Endpoint.parse(a, "studio")).command;
     try std.testing.expectEqualStrings("studio", label[2]);
+    const hop = (try Endpoint.parse(a, "ssh://me@mac:22/#it's P1")).command;
+    try std.testing.expectEqualStrings("me@mac", hop[10]);
+    try std.testing.expect(std.mem.endsWith(u8, hop[11], "exec rex --server 'it'\\''s P1' __internal dial-stdio"));
 }

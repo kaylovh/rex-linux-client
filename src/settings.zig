@@ -1,6 +1,7 @@
 //! Settings (status-line ⚙, Ctrl-b S): pages on the left, the page on the right.
-//!   General  — the language
-//!   Machines — this computer and the saved remote machines (nicknames, addresses)
+//!   General  — the language, the mouse (drag always selects)
+//!   Machines — this computer and the saved remote machines (nicknames, addresses),
+//!              and which of the connected server's own `rex hosts` the list shows
 //!   Server   — the connected Rex server (panel.zig draws it)
 
 const std = @import("std");
@@ -24,9 +25,20 @@ pub const Machine = struct {
     index: usize = 0,
 };
 
+/// One of the connected server's `rex hosts` (its own list of machines).
+pub const HostRow = struct {
+    name: []const u8,
+    /// what connecting to it uses (ssh://server#address for a server reached over ssh)
+    spec: []const u8,
+    shown: bool,
+    current: bool = false,
+};
+
 pub const Hit = union(enum) {
     page: Page,
     lang: i18n.Lang,
+    /// the "drag always selects text" switch
+    drag_select,
     machine: usize,
     /// a button: the key it stands for
     key: u21,
@@ -46,11 +58,13 @@ pub const nav_width = 18;
 
 pub const Settings = struct {
     page: Page = .general,
-    /// selected row on the Machines page
+    /// selected row on the General page: 0 language, 1 mouse
+    gsel: u1 = 0,
+    /// selected row on the Machines page: the machines, then the server's hosts
     sel: usize = 0,
     /// `sel` starts on the current machine
     sel_set: bool = false,
-    hits: [48]Rect = undefined,
+    hits: [96]Rect = undefined,
     hit_count: usize = 0,
 
     pub fn pageName(p: Page) []const u8 {
@@ -79,7 +93,7 @@ pub const Settings = struct {
 
     /// Draws the frame and the General / Machines page; returns the content window,
     /// where the caller draws the Server page.
-    pub fn draw(self: *Settings, area: vaxis.Window, arena: std.mem.Allocator, machines: []const Machine, config_path: []const u8, save_error: ?[]const u8) vaxis.Window {
+    pub fn draw(self: *Settings, area: vaxis.Window, arena: std.mem.Allocator, machines: []const Machine, hosts: []const HostRow, server_name: []const u8, config_path: []const u8, save_error: ?[]const u8, drag_selects: bool) vaxis.Window {
         self.hit_count = 0;
         area.fill(.{ .style = bg });
         const title = std.fmt.allocPrint(arena, " ⚙ {s} ", .{t("Settings", "设置")}) catch "";
@@ -103,8 +117,8 @@ pub const Settings = struct {
         while (y < area.height) : (y += 1) area.writeCell(nw, y, .{ .char = .{ .grapheme = "│" }, .style = .{ .bg = bg.bg, .fg = .{ .index = 240 } } });
         const content = area.child(.{ .x_off = nw + 2, .y_off = 2, .width = area.width -| (nw + 2), .height = area.height -| 2 });
         switch (self.page) {
-            .general => self.drawGeneral(content, arena, config_path, save_error),
-            .machines => self.drawMachines(content, arena, machines),
+            .general => self.drawGeneral(content, arena, config_path, save_error, drag_selects),
+            .machines => self.drawMachines(content, arena, machines, hosts, server_name),
             .server => {},
         }
         return content;
@@ -128,8 +142,8 @@ pub const Settings = struct {
         }
     }
 
-    fn drawGeneral(self: *Settings, win: vaxis.Window, arena: std.mem.Allocator, config_path: []const u8, save_error: ?[]const u8) void {
-        line(win, 0, &.{.{ .text = t("Language", "语言"), .style = head }});
+    fn drawGeneral(self: *Settings, win: vaxis.Window, arena: std.mem.Allocator, config_path: []const u8, save_error: ?[]const u8, drag_selects: bool) void {
+        line(win, 0, &.{.{ .text = t("Language", "语言"), .style = if (self.gsel == 0) sel_st else head }});
         const lw = win.child(.{ .y_off = 2, .height = 1 });
         var col: u16 = 2;
         for ([_]struct { i18n.Lang, []const u8 }{ .{ .zh, " 中文 " }, .{ .en, " English " } }) |o| {
@@ -142,13 +156,27 @@ pub const Settings = struct {
             col = r.col + 3;
         }
         line(win, 3, &.{.{ .text = t("  ←→ or click to change; applies at once", "  ←→ 或点击切换,立即生效"), .style = dim }});
-        line(win, 5, &.{.{ .text = t("Settings file", "设置文件"), .style = head }});
-        line(win, 6, &.{.{ .text = std.fmt.allocPrint(arena, "  {s}", .{config_path}) catch "", .style = bg }});
-        if (save_error) |e| line(win, 7, &.{.{ .text = std.fmt.allocPrint(arena, "  {s}: {s}", .{ t("saving failed", "保存失败"), e }) catch "", .style = .{ .bg = bg.bg, .fg = .{ .index = 203 } } }});
+        line(win, 5, &.{.{ .text = t("Mouse", "鼠标"), .style = if (self.gsel == 1) sel_st else head }});
+        if (win.height > 7) {
+            const mw = win.child(.{ .y_off = 7, .height = 1 });
+            const r = mw.print(&.{
+                .{ .text = if (drag_selects) "  [✓] " else "  [ ] ", .style = .{ .bg = bg.bg, .fg = .{ .index = if (drag_selects) 114 else 244 }, .bold = true } },
+                .{ .text = t("Dragging always selects text", "拖动总是选文字"), .style = bg },
+            }, .{ .wrap = .none });
+            self.addHit(@intCast(win.x_off), @intCast(win.x_off + r.col), @intCast(win.y_off + 7), .drag_select);
+        }
+        line(win, 8, &.{.{ .text = if (drag_selects)
+            t("      even in programs that use the mouse (vim, htop…); Shift-drag goes to them", "      在用鼠标的程序(vim、htop…)里也是;按住 Shift 拖动才交给程序")
+        else
+            t("      off: in programs that use the mouse, hold Shift to select", "      关闭时:在用鼠标的程序里,按住 Shift 拖动来选文字"), .style = dim }});
+        line(win, 9, &.{.{ .text = t("  ↑↓ pick a row, Space or click to switch", "  ↑↓ 选行,空格或点击切换"), .style = dim }});
+        line(win, 11, &.{.{ .text = t("Settings file", "设置文件"), .style = head }});
+        line(win, 12, &.{.{ .text = std.fmt.allocPrint(arena, "  {s}", .{config_path}) catch "", .style = bg }});
+        if (save_error) |e| line(win, 13, &.{.{ .text = std.fmt.allocPrint(arena, "  {s}: {s}", .{ t("saving failed", "保存失败"), e }) catch "", .style = .{ .bg = bg.bg, .fg = .{ .index = 203 } } }});
     }
 
-    fn drawMachines(self: *Settings, win: vaxis.Window, arena: std.mem.Allocator, machines: []const Machine) void {
-        if (self.sel >= machines.len) self.sel = machines.len -| 1;
+    fn drawMachines(self: *Settings, win: vaxis.Window, arena: std.mem.Allocator, machines: []const Machine, hosts: []const HostRow, server_name: []const u8) void {
+        if (self.sel >= machines.len + hosts.len) self.sel = machines.len + hosts.len -| 1;
         line(win, 0, &.{.{ .text = t("Machines", "机器"), .style = head }});
         line(win, 1, &.{.{ .text = t("  The sidebar lists these; click one there to switch to it.", "  侧栏会列出这些机器,在侧栏点一下就切换过去。"), .style = dim }});
         const name_w: u16 = 20;
@@ -185,10 +213,44 @@ pub const Settings = struct {
             self.addHit(@intCast(win.x_off), @intCast(win.x_off + win.width), @intCast(win.y_off + row), .{ .machine = i });
             row += 1;
         }
+        if (hosts.len > 0 and row + 6 < win.height) {
+            row += 1;
+            line(win, row, &.{
+                .{ .text = std.fmt.allocPrint(arena, "{s} {s}", .{ t("rex hosts on", "rex hosts,在"), server_name }) catch "", .style = head },
+            });
+            row += 1;
+            line(win, row, &.{.{ .text = t("  That machine's own list. Space: show it in the list above / hide it.", "  那台机器自己的机器列表。空格:显示到上面的列表里 / 隐藏。"), .style = dim }});
+            row += 1;
+            for (hosts, 0..) |h, j| {
+                if (row + 4 >= win.height) break;
+                const i = machines.len + j;
+                const st = if (i == self.sel) sel_st else bg;
+                const lw = win.child(.{ .y_off = row, .height = 1 });
+                lw.fill(.{ .style = st });
+                var name = h.name;
+                if (lw.gwidth(name) > name_w) name = name[0..@min(name.len, name_w)];
+                _ = lw.print(&.{
+                    .{ .text = if (h.shown) " ✓ " else " · ", .style = .{ .bg = st.bg, .fg = .{ .index = if (h.shown) 114 else 244 }, .bold = true } },
+                    .{ .text = name, .style = if (h.shown) st else .{ .bg = st.bg, .fg = .{ .index = if (i == self.sel) 252 else 246 } } },
+                }, .{ .wrap = .none });
+                _ = lw.print(&.{
+                    .{ .text = h.spec, .style = .{ .bg = st.bg, .fg = .{ .index = if (i == self.sel) 252 else 244 } } },
+                    .{ .text = if (h.current) t("   connected", "   已连接") else "", .style = .{ .bg = st.bg, .fg = .{ .index = 114 } } },
+                }, .{ .wrap = .none, .col_offset = name_w + 4 });
+                self.addHit(@intCast(win.x_off), @intCast(win.x_off + win.width), @intCast(win.y_off + row), .{ .machine = i });
+                row += 1;
+            }
+        }
         row += 1;
         const cur = if (self.sel < machines.len) machines[self.sel] else null;
         var defs: std.ArrayList(struct { []const u8, []const u8, u21 }) = .empty;
         defs.append(arena, .{ "a", t("add", "添加"), 'a' }) catch {};
+        if (self.sel >= machines.len and self.sel < machines.len + hosts.len) {
+            const h = hosts[self.sel - machines.len];
+            defs.append(arena, .{ "Space", if (h.shown) t("hide", "隐藏") else t("show", "显示"), ' ' }) catch {};
+            if (!h.current) defs.append(arena, .{ "Enter", t("connect", "连接"), vaxis.Key.enter }) catch {};
+            defs.append(arena, .{ "s", t("save with a name", "保存并命名"), 's' }) catch {};
+        }
         if (cur) |m| {
             if (!m.current) defs.append(arena, .{ "Enter", t("connect", "连接"), vaxis.Key.enter }) catch {};
             switch (m.source) {
@@ -207,6 +269,7 @@ pub const Settings = struct {
         row += 1;
         const forms = [_][]const u8{
             t("  ssh://user@host[:port]   any machine with Rex, over ssh (needs key login)", "  ssh://用户@主机[:端口]   任何装了 Rex 的机器,走 ssh(需要密钥登录)"),
+            t("  ssh://user@host#address  a Rex server as that machine reaches it, through it", "  ssh://用户@主机#地址      经那台机器中转,地址按那台机器的写法"),
             t("  a label from `rex hosts`, a Tailscale name, host:port", "  `rex hosts` 里的名字、Tailscale 名字、主机:端口"),
             t("  unix:///path/to/server.sock", "  unix:///路径/server.sock"),
         };
