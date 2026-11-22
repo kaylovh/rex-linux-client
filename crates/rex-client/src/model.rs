@@ -36,6 +36,8 @@ pub struct SessionModel {
     pub sessions: Vec<SessionInfo>,
     pub current: Option<String>,
     pub view: Option<Value>,
+    /// The highest view revision announced for the current session.
+    announced: u64,
     /// block id -> (session id, record id -> status)
     status: HashMap<String, (String, HashMap<String, Status>)>,
 }
@@ -105,6 +107,9 @@ impl SessionModel {
                     return Effect::Nothing;
                 }
                 let have = self.view.as_ref().and_then(revision);
+                if let Some(r) = revision(p) {
+                    self.announced = self.announced.max(r);
+                }
                 match (revision(p), have) {
                     (Some(new), Some(old)) if new <= old => Effect::Nothing,
                     _ => Effect::RefetchView(sid.to_string()),
@@ -147,6 +152,18 @@ impl SessionModel {
     pub fn set_status(&mut self, session_id: &str, block_id: &str, record_id: String, state: Status) {
         let entry = self.status.entry(block_id.to_string()).or_insert_with(|| (session_id.to_string(), HashMap::new()));
         entry.1.insert(record_id, state);
+    }
+
+    /// Whether a change was announced that the held view doesn't have yet (call after a fetch
+    /// lands: a change announced while it was running may not be in it).
+    pub fn needs_refetch(&self) -> bool {
+        self.current.is_some() && self.view.as_ref().and_then(revision).is_none_or(|have| self.announced > have)
+            && self.announced > 0
+    }
+
+    /// Forgets announced revisions (when another session is shown).
+    pub fn reset_announced(&mut self) {
+        self.announced = 0;
     }
 
     /// Keeps `view` if it is newer than the one held; false if it was stale.
@@ -206,6 +223,25 @@ mod tests {
         );
         // Another session's view changes don't concern the current view.
         assert_eq!(m.apply_event(&session_event("s2", "session_view_changed", json!({"revision": 99}))), Effect::Nothing);
+    }
+
+    #[test]
+    fn change_during_fetch_is_not_lost() {
+        let mut m = SessionModel { current: Some("s1".into()), ..Default::default() };
+        m.set_view(view(5));
+        assert!(!m.needs_refetch());
+        // Two changes announced; the fetch that was already running answers with rev 6.
+        m.apply_event(&session_event("s1", "session_view_changed", json!({"revision": 6})));
+        m.apply_event(&session_event("s1", "session_view_changed", json!({"revision": 7})));
+        m.set_view(view(6));
+        assert!(m.needs_refetch());
+        m.set_view(view(7));
+        assert!(!m.needs_refetch());
+        // A new session starts over.
+        m.current = Some("s2".into());
+        m.view = None;
+        m.reset_announced();
+        assert!(!m.needs_refetch());
     }
 
     #[test]

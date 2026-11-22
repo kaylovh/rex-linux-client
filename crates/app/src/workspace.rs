@@ -119,8 +119,11 @@ pub struct Workspace {
     banner: Option<String>,
     prefix: bool,
     area: Rc<Cell<Bounds<Pixels>>>,
-    /// (separator index, ratio under the pointer)
-    drag: Option<(usize, f32)>,
+    /// The border being dragged: (before block, after block, direction) and the ratio under the pointer.
+    drag: Option<(String, String, Direction, f32)>,
+    /// Keys reach the workspace even when no terminal has focus.
+    focus: FocusHandle,
+    _subs: Vec<Subscription>,
     fetching_view: bool,
     tasks: Vec<Task<()>>,
 }
@@ -141,6 +144,14 @@ impl Workspace {
                 }
             });
         }));
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+        let this = cx.weak_entity();
+        let key_sub = cx.intercept_keystrokes(move |ev, window, cx| {
+            if let Some(w) = this.upgrade() {
+                w.update(cx, |w, cx| w.on_keystroke(ev, window, cx));
+            }
+        });
         let me = Self {
             endpoint,
             control: None,
@@ -155,6 +166,8 @@ impl Workspace {
             prefix: false,
             area: Rc::new(Cell::new(Bounds::default())),
             drag: None,
+            focus,
+            _subs: vec![key_sub],
             fetching_view: false,
             tasks,
         };
@@ -200,6 +213,7 @@ impl Workspace {
         let Some(control) = self.control() else { return };
         self.model.current = Some(sid.clone());
         self.model.view = None;
+        self.model.reset_announced();
         self.active_window = None;
         let label = self.model.sessions.iter().find(|s| s.id == sid).map(|s| s.label.clone()).unwrap_or_default();
         window.set_window_title(&format!("rexa-desktop — {label}"));
@@ -241,6 +255,10 @@ impl Workspace {
                 if let Ok(v) = v {
                     this.apply_view(v, window, cx);
                 }
+                // A change announced while this fetch ran may not be in it.
+                if this.model.needs_refetch() {
+                    this.refetch_view(window, cx);
+                }
             });
         }));
     }
@@ -264,9 +282,12 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Focuses the server's focused block, or the workspace itself when that isn't a live
+    /// terminal, so shortcuts keep working.
     fn focus_terminal(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(term) = self.focused_block.as_deref().and_then(|b| self.panes.terminal(b)) {
-            term.read(cx).focus_handle().clone().focus(window, cx);
+        match self.focused_block.as_deref().and_then(|b| self.panes.terminal(b)) {
+            Some(term) => term.read(cx).focus_handle().clone().focus(window, cx),
+            None => self.focus.focus(window, cx),
         }
     }
 
@@ -313,7 +334,13 @@ impl Workspace {
             self.model.view.as_ref().is_some_and(|v| v["windows"].as_array().into_iter().flatten().any(|w| w["window_id"] == id))
         };
         match ev {
-            TabsEvent::Selected(id) if Some(id.as_ref()) != self.active_window.as_deref() && in_view(id) => {
+            // Only a selection the strip still shows: removing tabs during a sync emits
+            // Selected for a neighbour that the sync then replaces with the server's choice.
+            TabsEvent::Selected(id)
+                if Some(id.as_ref()) != self.active_window.as_deref()
+                    && in_view(id)
+                    && self.tabs.read(cx).selected().map(|s| s.as_ref()) == Some(id.as_ref()) =>
+            {
                 self.send("session.focus_window", json!({"session_id": sid, "window_id": id.as_ref()}));
             }
             TabsEvent::AddRequested => self.run(Command::NewTab, window, cx),
@@ -515,9 +542,11 @@ impl Workspace {
                 self.banner = None;
                 if ev["resumed"] != true {
                     // A new client: attach everything again.
-                    if let (Some(c), Some(sid)) = (self.control(), self.sid()) {
-                        let _ = c.call("session.attach_all", json!({"event_scope": "all"}));
-                        let _ = sid;
+                    if let Some(c) = self.control() {
+                        cx.background_spawn(async move {
+                            let _ = c.call("session.attach_all", json!({"event_scope": "all"}));
+                        })
+                        .detach();
                     }
                     self.recover_all(window, cx);
                 }
@@ -651,8 +680,9 @@ impl Workspace {
         }));
     }
 
-    /// Ctrl-b and the key after it, and the GUI shortcuts, before the terminal sees them.
-    fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    /// Ctrl-b and the key after it, and the GUI shortcuts, before key bindings and the
+    /// terminal see them.
+    fn on_keystroke(&mut self, ev: &KeystrokeEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         if self.prefix {
             self.prefix = false;
@@ -702,6 +732,57 @@ impl Workspace {
             )
     }
 
+    fn pane_cell(&self, p: &rex_client::layout::Pane, cx: &mut Context<Self>) -> Div {
+        let r = p.rect;
+        let focused = self.focused_block.as_deref() == Some(p.block_id.as_str());
+        let bid = p.block_id.clone();
+        let cell = div()
+            .absolute()
+            .left(relative(r.x))
+            .top(relative(r.y))
+            .w(relative(r.w))
+            .h(relative(r.h))
+            .p(px(1.))
+            .border_1()
+            .border_color(if focused { rgb(0x5a8dee) } else { rgb(0x2a2a2a) })
+            .when(p.floating, |d| d.bg(rgb(0x1e1e1e)).occlude())
+            // Capture phase: a program that takes the mouse stops the click in the terminal.
+            .capture_any_mouse_down(cx.listener(move |this, _, _, _| {
+                if this.focused_block.as_deref() != Some(bid.as_str())
+                    && let Some(sid) = this.sid()
+                {
+                    this.send("session.focus_block", json!({"session_id": sid, "block_id": bid}));
+                }
+            }));
+        match (p.terminal, self.panes.terminal(&p.block_id)) {
+            (true, Some(term)) => {
+                let mut c = cell.child(Terminal::new(SharedString::from(format!("t-{}", p.block_id)), term));
+                if let Some(text) = self.panes.status(&p.block_id).text() {
+                    c = c.child(div().absolute().bottom_0().left_0().right_0().px_2().bg(rgb(0x3a3a3a)).text_sm().text_color(rgb(0xe0e0e0)).child(text));
+                }
+                c
+            }
+            (true, None) => cell.child(
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(0x909090))
+                    .child(self.panes.status(&p.block_id).text().unwrap_or_default()),
+            ),
+            (false, _) => cell.child(
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(0x909090))
+                    .child(format!("{} {}", p.label, t("(not a terminal)", "(不是终端)"))),
+            ),
+        }
+    }
+
     fn render_panes(&self, cx: &mut Context<Self>) -> Div {
         let area = self.area.clone();
         let mut root = div()
@@ -709,60 +790,12 @@ impl Workspace {
             .min_h_0()
             .relative()
             .child(canvas(move |bounds, _, _| area.set(bounds), |_, _, _, _| {}).absolute().size_full());
-        for p in &self.layout.panes {
-            let r = p.rect;
-            let focused = self.focused_block.as_deref() == Some(p.block_id.as_str());
-            let bid = p.block_id.clone();
-            let mut cell = div()
-                .absolute()
-                .left(relative(r.x))
-                .top(relative(r.y))
-                .w(relative(r.w))
-                .h(relative(r.h))
-                .p(px(1.))
-                .border_1()
-                .border_color(if focused { rgb(0x5a8dee) } else { rgb(0x2a2a2a) })
-                .when(p.floating, |d| d.bg(rgb(0x1e1e1e)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, _| {
-                        if this.focused_block.as_deref() != Some(bid.as_str())
-                            && let Some(sid) = this.sid()
-                        {
-                            this.send("session.focus_block", json!({"session_id": sid, "block_id": bid}));
-                        }
-                    }),
-                );
-            cell = match (p.terminal, self.panes.terminal(&p.block_id)) {
-                (true, Some(term)) => {
-                    let mut c = cell.child(Terminal::new(SharedString::from(format!("t-{}", p.block_id)), term));
-                    if let Some(text) = self.panes.status(&p.block_id).text() {
-                        c = c.child(div().absolute().bottom_0().left_0().right_0().px_2().bg(rgb(0x3a3a3a)).text_sm().text_color(rgb(0xe0e0e0)).child(text));
-                    }
-                    c
-                }
-                (true, None) => cell.child(
-                    div().size_full().flex().items_center().justify_center().text_color(rgb(0x909090)).child(
-                        self.panes.status(&p.block_id).text().unwrap_or_default(),
-                    ),
-                ),
-                (false, _) => cell.child(
-                    div()
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(rgb(0x909090))
-                        .child(format!("{} {}", p.label, t("(not a terminal)", "(不是终端)"))),
-                ),
-            };
-            root = root.child(cell);
+        for p in self.layout.panes.iter().filter(|p| !p.floating) {
+            root = root.child(self.pane_cell(p, cx));
         }
-        for (i, s) in self.layout.separators.iter().enumerate() {
-            let at = match self.drag {
-                Some((d, ratio)) if d == i => ratio,
-                _ => s.ratio,
-            };
+        for s in &self.layout.separators {
+            let dragging = self.drag.as_ref().filter(|(b, a, d, _)| *b == s.before_block && *a == s.after_block && *d == s.direction);
+            let at = dragging.map_or(s.ratio, |(_, _, _, r)| *r);
             let hit = match s.direction {
                 Direction::Horizontal => div()
                     .absolute()
@@ -781,45 +814,62 @@ impl Workspace {
                     .w(relative(s.rect.w))
                     .cursor(CursorStyle::ResizeUpDown),
             };
-            let hit = hit
-                .when(self.drag.is_some_and(|(d, _)| d == i), |d| d.bg(rgb(0x5a8dee)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        let r = this.layout.separators.get(i).map(|s| s.ratio).unwrap_or(0.5);
-                        this.drag = Some((i, r));
-                        cx.stop_propagation();
-                        cx.notify();
-                    }),
-                );
+            let key = (s.before_block.clone(), s.after_block.clone(), s.direction, s.ratio);
+            let hit = hit.when(dragging.is_some(), |d| d.bg(rgb(0x5a8dee))).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.drag = Some(key.clone());
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            );
             root = root.child(hit);
         }
-        root.on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
-            let Some((i, _)) = this.drag else { return };
-            let b = this.area.get();
-            if b.size.width <= px(0.) || b.size.height <= px(0.) {
-                return;
-            }
-            let fx = (ev.position.x - b.origin.x) / b.size.width;
-            let fy = (ev.position.y - b.origin.y) / b.size.height;
-            if let Some(s) = this.layout.separators.get(i) {
-                this.drag = Some((i, s.ratio_at(fx, fy)));
-                cx.notify();
-            }
-        }))
-        .on_mouse_up(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                let Some((i, ratio)) = this.drag.take() else { return };
-                if let (Some(s), Some(sid)) = (this.layout.separators.get(i), this.sid()) {
-                    let direction = if s.direction == Direction::Horizontal { "horizontal" } else { "vertical" };
-                    this.send(
-                        "session.resize_pane",
-                        json!({"session_id": sid, "direction": direction, "before_block_id": s.before_block, "after_block_id": s.after_block, "ratio": ratio}),
-                    );
-                }
-                cx.notify();
-            }),
+        for p in self.layout.panes.iter().filter(|p| p.floating) {
+            root = root.child(self.pane_cell(p, cx));
+        }
+        root
+    }
+
+    /// While a border is dragged: a layer over the whole window that follows the pointer and
+    /// ends the drag wherever the button is released.
+    fn drag_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let (_, _, direction, _) = self.drag.as_ref()?;
+        let cursor = if *direction == Direction::Horizontal { CursorStyle::ResizeLeftRight } else { CursorStyle::ResizeUpDown };
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .cursor(cursor)
+                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                    let b = this.area.get();
+                    if b.size.width <= px(0.) || b.size.height <= px(0.) {
+                        return;
+                    }
+                    let fx = (ev.position.x - b.origin.x) / b.size.width;
+                    let fy = (ev.position.y - b.origin.y) / b.size.height;
+                    let Some((before, after, dir, _)) = this.drag.clone() else { return };
+                    if let Some(s) = this.layout.separators.iter().find(|s| s.before_block == before && s.after_block == after && s.direction == dir) {
+                        this.drag = Some((before, after, dir, s.ratio_at(fx, fy)));
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        let Some((before, after, dir, ratio)) = this.drag.take() else { return };
+                        let still = this.layout.separators.iter().any(|s| s.before_block == before && s.after_block == after && s.direction == dir);
+                        if still && let Some(sid) = this.sid() {
+                            let direction = if dir == Direction::Horizontal { "horizontal" } else { "vertical" };
+                            this.send(
+                                "session.resize_pane",
+                                json!({"session_id": sid, "direction": direction, "before_block_id": before, "after_block_id": after, "ratio": ratio}),
+                            );
+                        }
+                        cx.notify();
+                    }),
+                ),
         )
     }
 }
@@ -827,7 +877,7 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let status = if self.prefix {
-            Some(t("Ctrl-b … (press a key: c new tab, % split, z zoom, ? help)", "Ctrl-b …(再按一个键:c 新 tab、% 分屏、z 放大)").to_string())
+            Some(t("Ctrl-b … (press a key: c new tab, % split, z zoom)", "Ctrl-b …(再按一个键:c 新 tab、% 分屏、z 放大)").to_string())
         } else {
             self.banner.clone()
         };
@@ -841,7 +891,9 @@ impl Render for Workspace {
             .when_some(status, |d, s| d.child(div().px_3().py_1().bg(rgb(0x3a3a3a)).text_color(rgb(0xe0e0e0)).text_sm().child(s)));
         div()
             .size_full()
-            .capture_key_down(cx.listener(Self::on_key))
+            .relative()
+            .track_focus(&self.focus)
             .child(SidebarLayout::new(&self.sidebar).sidebar(self.render_sidebar(cx)).child(main))
+            .children(self.drag_overlay(cx))
     }
 }
