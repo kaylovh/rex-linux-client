@@ -10,3 +10,12 @@ base64.workspace = true
 sha1.workspace = true
 getrandom.workspace = true
 libc.workspace = true
+serde_json.workspace = true
+async-channel.workspace = true
+
+[features]
+# Test helpers: an isolated Rex server, a way to drop the control connection.
+test-hooks = []
+
+[dev-dependencies]
+rex-proto = { path = ".", features = ["test-hooks"] }
