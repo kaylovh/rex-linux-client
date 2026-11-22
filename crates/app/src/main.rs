@@ -2,6 +2,8 @@
 //!
 //!     rexa-desktop [-S ENDPOINT] [SESSION]
 
+mod panes;
+
 use std::sync::Arc;
 
 use gpui_kit::*;
