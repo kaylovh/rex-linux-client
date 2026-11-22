@@ -1,3 +1,4 @@
+// Changed for rexa-desktop (from gpui-cn 0.9.0, Apache-2.0): re-exports InputRoute.
 //! A terminal on libghostty-vt, the terminal emulation library from
 //! [Ghostty](https://ghostty.org), behind the `ghostty` feature.
 //!
@@ -210,7 +211,7 @@ mod theme;
 pub use appearance::TerminalAppearance;
 pub use element::{KEY_CONTEXT, Terminal};
 pub use engine::{
-    ByteHandle, ByteSink, ByteSource, Engine, ExitStatus, ForegroundProcess, InputRejected,
+    ByteHandle, ByteSink, ByteSource, Engine, ExitStatus, ForegroundProcess, InputRejected, InputRoute,
     TerminalSnapshot, TerminalStatus,
 };
 pub use frame::{

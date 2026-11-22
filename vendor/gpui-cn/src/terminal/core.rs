@@ -1,3 +1,4 @@
+// Changed for rexa-desktop (from gpui-cn 0.9.0, Apache-2.0): Core::from_snapshot.
 //! The Ghostty terminal, render state and encoders owned by one thread.
 //!
 //! `Core` turns bytes into [`TerminalFrame`]s and typed input into the bytes
@@ -295,6 +296,25 @@ impl Core {
 
     /// Rebuilds a parked core from its snapshot. The first frame after it
     /// is built in full.
+    /// A core around a decoded Ghostty snapshot, at the snapshot's grid size with the cell
+    /// size of `cell`.
+    pub(crate) fn from_snapshot(
+        bytes: &[u8],
+        cell: Viewport,
+        options: &EngineOptions,
+        colors: TerminalColors,
+    ) -> io::Result<Self> {
+        let terminal = vt::snapshot::Decoder::from_slice(bytes).decode().map_err(fault)?;
+        let viewport = Viewport::new(
+            terminal.cols().map_err(fault)?,
+            terminal.rows().map_err(fault)?,
+            cell.cell_width(),
+            cell.cell_height(),
+        )
+        .ok_or_else(|| io::Error::other("snapshot grid out of range"))?;
+        Self::around(terminal, viewport, options, colors)
+    }
+
     pub(crate) fn restore(
         bytes: &[u8],
         parked: Parked,

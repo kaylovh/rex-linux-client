@@ -1,3 +1,4 @@
+// Changed for rexa-desktop (from gpui-cn 0.9.0, Apache-2.0): EngineOptions::with_snapshot and with_source_sized.
 //! Options for the engine and for a local terminal.
 
 use std::collections::BTreeMap;
@@ -22,6 +23,10 @@ pub struct EngineOptions {
     /// protocol off.
     pub(crate) image_storage_bytes: u64,
     pub(crate) park: crate::terminal::park::ParkOptions,
+    /// A Ghostty snapshot to start from instead of an empty terminal.
+    pub(crate) snapshot: Option<Vec<u8>>,
+    /// The source sets the grid size (with `ByteSink::set_grid`); a UI resize is only passed on.
+    pub(crate) source_sized: bool,
 }
 
 impl Default for EngineOptions {
@@ -34,6 +39,8 @@ impl Default for EngineOptions {
             // libghostty-vt's default.
             image_storage_bytes: 10_000_000,
             park: crate::terminal::park::ParkOptions::default(),
+            snapshot: None,
+            source_sized: false,
         }
     }
 }
@@ -82,6 +89,26 @@ impl EngineOptions {
     #[must_use]
     pub fn with_park(mut self, park: crate::terminal::park::ParkOptions) -> Self {
         self.park = park;
+        self
+    }
+
+    /// Start from a Ghostty snapshot (such as the one a Rex terminal stream begins with)
+    /// instead of an empty terminal. The grid takes the snapshot's size.
+    #[must_use]
+    pub fn with_snapshot(mut self, snapshot: Vec<u8>) -> Self {
+        self.snapshot = Some(snapshot);
+        self
+    }
+
+    /// Let the source decide the grid size, through [`ByteSink::set_grid`]. A UI resize then
+    /// only reaches [`ByteHandle::resize`]; the grid keeps the source's size, cropped or
+    /// padded by the view.
+    ///
+    /// [`ByteSink::set_grid`]: crate::terminal::ByteSink::set_grid
+    /// [`ByteHandle::resize`]: crate::terminal::ByteHandle::resize
+    #[must_use]
+    pub fn with_source_sized(mut self, on: bool) -> Self {
+        self.source_sized = on;
         self
     }
 

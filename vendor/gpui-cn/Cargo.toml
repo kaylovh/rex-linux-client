@@ -34,7 +34,6 @@ keywords = [
 categories = ["gui"]
 license = "Apache-2.0"
 repository = "https://github.com/prabirshrestha/gpui-cn"
-resolver = "2"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -269,6 +268,10 @@ path = "tests/terminal_pty.rs"
 [[test]]
 name = "terminal_pty_windows"
 path = "tests/terminal_pty_windows.rs"
+
+[[test]]
+name = "terminal_rex"
+path = "tests/terminal_rex.rs"
 
 [[test]]
 name = "terminal_stream"

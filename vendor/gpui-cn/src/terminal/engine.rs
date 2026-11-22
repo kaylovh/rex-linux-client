@@ -1,3 +1,4 @@
+// Changed for rexa-desktop (from gpui-cn 0.9.0, Apache-2.0): ByteHandle::route_input/InputRoute, ByteSink::set_grid, and engine support for snapshot starts and source-sized grids.
 //! The owner thread: one thread per terminal that owns the Ghostty state,
 //! parses output, encodes input and publishes frames.
 //!
@@ -300,8 +301,22 @@ pub trait ByteSource: Send + 'static {
     ) -> io::Result<Box<dyn ByteHandle>>;
 }
 
+/// What the engine does with an input after asking the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputRoute {
+    /// Encode it for the program and write the bytes, as usual.
+    Encode,
+    /// The source took care of it (for example, sent it to a server that encodes keys).
+    Handled,
+}
+
 /// The engine's side of a byte source.
 pub trait ByteHandle: Send {
+    /// Offered every input before it is encoded. The default encodes everything.
+    fn route_input(&self, input: &TerminalInput) -> InputRoute {
+        let _ = input;
+        InputRoute::Encode
+    }
     /// Write input for the program without blocking: as much of `bytes` as
     /// it takes now, and return how much that was. When that is less than
     /// all of it, the source calls [`ByteSink::writable`] once more fits,
@@ -337,7 +352,7 @@ impl ByteSink {
         if self.shared.closing.load(Ordering::Acquire) {
             return false;
         }
-        mail.reads.push_back(bytes.to_vec());
+        mail.reads.push_back(Read::Bytes(bytes.to_vec()));
         mail.read_bytes += bytes.len();
         mail.generation = mail.generation.wrapping_add(1);
         self.shared.wake.notify_one();
@@ -358,6 +373,19 @@ impl ByteSink {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         !self.shared.closing.load(Ordering::Acquire)
+    }
+
+    /// Set the grid to `columns` by `rows` at this point in the output (for an engine with
+    /// [`EngineOptions::with_source_sized`]; otherwise the next UI resize undoes it).
+    pub fn set_grid(&self, columns: u16, rows: u16) -> bool {
+        let mut mail = self.shared.lock();
+        if self.shared.closing.load(Ordering::Acquire) {
+            return false;
+        }
+        mail.reads.push_back(Read::Grid(columns, rows));
+        mail.generation = mail.generation.wrapping_add(1);
+        self.shared.wake.notify_one();
+        true
     }
 
     /// The program can take input again after a short
@@ -397,11 +425,17 @@ impl std::fmt::Display for InputRejected {
 
 impl std::error::Error for InputRejected {}
 
+/// Output from the source, in order.
+enum Read {
+    Bytes(Vec<u8>),
+    Grid(u16, u16),
+}
+
 #[derive(Default)]
 struct Mailbox {
     commands: VecDeque<TerminalInput>,
     bytes: usize,
-    reads: VecDeque<Vec<u8>>,
+    reads: VecDeque<Read>,
     /// The bytes in `reads`.
     read_bytes: usize,
     /// The source said it can take input again.
@@ -775,6 +809,9 @@ struct Parking {
 
 struct Owner {
     shared: Arc<Shared>,
+    /// The size the UI last asked for (its cell size sizes a source-set grid).
+    ui_viewport: Viewport,
+    source_sized: bool,
     core: CoreSlot,
     parking: Parking,
     handle: Box<dyn ByteHandle>,
@@ -808,7 +845,10 @@ impl Owner {
         shared: Arc<Shared>,
         sink: &FrameSink,
     ) -> io::Result<Self> {
-        let mut core = Core::new(config.viewport, &config.options, config.colors)?;
+        let mut core = match &config.options.snapshot {
+            Some(bytes) => Core::from_snapshot(bytes, config.viewport, &config.options, config.colors)?,
+            None => Core::new(config.viewport, &config.options, config.colors)?,
+        };
         if let Some((shape, blinking)) = config.cursor {
             core.set_cursor(shape, blinking)?;
         }
@@ -828,8 +868,10 @@ impl Owner {
                 live: Some(core),
                 parked: None,
             },
+            ui_viewport: config.viewport,
+            source_sized: config.options.source_sized,
             parking: Parking {
-                options: config.options.clone(),
+                options: EngineOptions { snapshot: None, ..config.options.clone() },
                 key: crate::terminal::park::next_key(),
                 last_use: Instant::now(),
             },
@@ -939,8 +981,17 @@ impl Owner {
             self.force = true;
         }
         if !reads.is_empty() {
-            for chunk in reads {
-                self.core.write(&chunk, &mut self.effects);
+            for read in reads {
+                match read {
+                    Read::Bytes(chunk) => self.core.write(&chunk, &mut self.effects),
+                    Read::Grid(columns, rows) => {
+                        let cell = self.ui_viewport;
+                        if let Some(grid) = Viewport::new(columns, rows, cell.cell_width(), cell.cell_height()) {
+                            self.core.resize(grid, &mut self.effects)?;
+                            self.force = true;
+                        }
+                    }
+                }
             }
             self.compression_deadline = Some(Instant::now() + COMPRESSION_IDLE);
             self.foreground_due
@@ -961,11 +1012,20 @@ impl Owner {
             } else {
                 Vec::new()
             };
-            bytes.extend(self.core.input(interrupt)?);
+            if self.handle.route_input(&interrupt) == InputRoute::Encode {
+                bytes.extend(self.core.input(interrupt)?);
+            }
             self.urgent.extend(bytes);
             self.dirty = true;
         }
-        if let Some(viewport) = viewport {
+        if let Some(viewport) = viewport
+            && self.source_sized
+        {
+            self.ui_viewport = viewport;
+            self.handle.resize(viewport)?;
+            self.dirty = true;
+        } else if let Some(viewport) = viewport {
+            self.ui_viewport = viewport;
             self.core.resize(viewport, &mut self.effects)?;
             self.handle.resize(viewport)?;
             self.apply_effects()?;
@@ -975,6 +1035,8 @@ impl Owner {
         if let Some(input) = command {
             let budget = input.budget();
             if self.exit.is_some() && !matches!(input, TerminalInput::Scroll(_)) {
+                self.release(budget);
+            } else if self.handle.route_input(&input) == InputRoute::Handled {
                 self.release(budget);
             } else {
                 let paste = matches!(input, TerminalInput::Paste(_));
