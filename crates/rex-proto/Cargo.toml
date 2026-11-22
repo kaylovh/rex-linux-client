@@ -6,3 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+base64.workspace = true
+sha1.workspace = true
+getrandom.workspace = true
