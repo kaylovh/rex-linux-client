@@ -9,3 +9,9 @@ license.workspace = true
 ghostty-vt.workspace = true
 gpui-kit.workspace = true
 gpui-cn = { path = "../../vendor/gpui-cn", features = ["ghostty", "jetbrains-mono"] }
+rex-proto = { path = "../rex-proto" }
+serde_json.workspace = true
+async-channel.workspace = true
+
+[dev-dependencies]
+rex-proto = { path = "../rex-proto", features = ["test-hooks"] }

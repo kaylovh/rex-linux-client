@@ -156,6 +156,12 @@ impl DataConn {
         self.writer.shutdown();
     }
 
+    /// A function that does what [`shutdown`](Self::shutdown) does, for another thread to keep.
+    pub fn closer(&self) -> impl Fn() + Send + 'static {
+        let w = self.writer.clone();
+        move || w.shutdown()
+    }
+
     /// Ends the stream for good (status 1000).
     pub fn close(self) {
         let _ = self.writer.close(1000);

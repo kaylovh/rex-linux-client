@@ -1,4 +1,8 @@
-//! Terminal views for Rex blocks.
+//! Terminal views for Rex blocks: gpui-cn's terminal (vendored) fed by a Rex data stream.
+
+pub mod rex;
+
+pub use gpui_cn::terminal;
 
 #[cfg(test)]
 mod tests {

@@ -6799,9 +6799,12 @@ dependencies = [
 name = "rexterm"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "ghostty-vt",
  "gpui-cn",
  "gpui-kit",
+ "rex-proto",
+ "serde_json",
 ]
 
 [[package]]
