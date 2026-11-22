@@ -1,0 +1,13 @@
+[package]
+name = "rexa-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui-kit.workspace = true
+gpui-cn = { path = "../../vendor/gpui-cn", features = ["ghostty", "jetbrains-mono"] }
+rex-proto = { path = "../rex-proto" }
+rexterm = { path = "../rexterm" }
+serde_json.workspace = true

@@ -6796,6 +6796,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rexa-desktop"
+version = "0.1.0"
+dependencies = [
+ "gpui-cn",
+ "gpui-kit",
+ "rex-proto",
+ "rexterm",
+ "serde_json",
+]
+
+[[package]]
 name = "rexterm"
 version = "0.1.0"
 dependencies = [
