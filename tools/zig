@@ -1,0 +1,3 @@
+#!/bin/sh
+# Pinned Zig toolchain for building libghostty-vt (needs exactly 0.17.x).
+exec "$HOME/.local/share/zig/0.17.1/zig" "$@"

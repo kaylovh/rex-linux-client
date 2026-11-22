@@ -1,0 +1,2 @@
+[env]
+ZIG = { value = "tools/zig", relative = true }
