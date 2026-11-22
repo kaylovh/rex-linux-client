@@ -6809,6 +6809,7 @@ version = "1.0.0-dev"
 dependencies = [
  "gpui-cn",
  "gpui-kit",
+ "rex-client",
  "rex-proto",
  "rexterm",
  "serde_json",

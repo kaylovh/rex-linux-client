@@ -10,4 +10,5 @@ gpui-kit.workspace = true
 gpui-cn = { path = "../../vendor/gpui-cn", features = ["ghostty", "jetbrains-mono"] }
 rex-proto = { path = "../rex-proto" }
 rexterm = { path = "../rexterm" }
+rex-client = { path = "../rex-client" }
 serde_json.workspace = true
