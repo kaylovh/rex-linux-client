@@ -221,7 +221,7 @@ impl ByteHandle for RexHandle {
                 return;
             }
             let ids = json!({"session_id": block.session_id, "block_id": block.block_id});
-            let mut own = json!({"session_id": block.session_id, "block_ids": [block.block_id], "mode": "take"});
+            let own = json!({"session_id": block.session_id, "block_ids": [block.block_id], "mode": "take"});
             block.control.send("session.own_block", own);
             let mut req = ids;
             req["args"] = json!({"columns": size.0, "rows": size.1});
@@ -252,10 +252,12 @@ impl ByteHandle for RexHandle {
                 }
                 None => InputRoute::Encode,
             },
+            // An input method's commit. As a client.key it stays in order with the keys
+            // around it (a block method such as terminal.write is not ordered with them).
             TerminalInput::Text(s) => {
                 let mut p = self.ids();
-                p["args"] = json!({"data": s});
-                self.block.control.send("com.superlogical.terminal.write", p);
+                p["key"] = keys::text_key(s);
+                self.block.control.send("client.key", p);
                 InputRoute::Handled
             }
             TerminalInput::Paste(s) => {

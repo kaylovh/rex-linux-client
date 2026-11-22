@@ -84,7 +84,7 @@ fn typing_reaches_program() {
 }
 
 #[test]
-fn ime_text_goes_to_write() {
+fn ime_text_reaches_program_in_order() {
     let Some(srv) = TestServer::start() else { return };
     let ctl = Control::connect(srv.endpoint.clone(), "rexa-desktop-test").unwrap();
     let (sid, bid) = session(&ctl, Some(&["cat"]));

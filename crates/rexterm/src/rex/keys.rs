@@ -71,14 +71,29 @@ fn named(key: &str) -> Option<(String, u32)> {
     Some((name.to_string(), cp))
 }
 
+/// Text with no key behind it, such as an input method's commit: an `unidentified` key that
+/// types `text`. Sent as a `client.key`, it stays in order with the keys around it.
+pub fn text_key(text: &str) -> Value {
+    json!({
+        "key": "unidentified",
+        "mods": "",
+        "consumed_mods": "",
+        "text": text,
+        "unshifted_codepoint": 0,
+        "composing": false,
+        "action": "press",
+    })
+}
+
 pub fn to_rex_key(k: &KeyInput) -> Option<Value> {
     let m = k.modifiers;
     let mut chars = k.key.chars();
     let (name, unshifted, default_text) = match (chars.next(), chars.next()) {
-        (Some(c), None) if c != ' ' => {
-            let (name, base) = printable(c)?;
-            (name, base as u32, Some(c.to_string()))
-        }
+        (Some(c), None) if c != ' ' => match printable(c) {
+            Some((name, base)) => (name, base as u32, Some(c.to_string())),
+            // A key from another layout (ü, é, ...): no US physical key, but its text.
+            None => ("unidentified".to_string(), c.to_lowercase().next().map_or(0, |l| l as u32), Some(c.to_string())),
+        },
         _ => {
             let (name, cp) = named(&k.key)?;
             (name, cp, (k.key == "space").then(|| " ".to_string()))
@@ -168,7 +183,22 @@ mod tests {
     }
 
     #[test]
-    fn unknown_key_is_none() {
-        assert!(to_rex_key(&KeyInput::new("ü")).is_none());
+    fn non_us_letter_is_unidentified_with_text() {
+        let v = to_rex_key(&KeyInput::new("ü").with_text("ü")).unwrap();
+        assert_eq!(v["key"], "unidentified");
+        assert_eq!(v["text"], "ü");
+    }
+
+    #[test]
+    fn text_key_carries_ime_text() {
+        assert_eq!(
+            text_key("中文"),
+            json!({"key":"unidentified","mods":"","consumed_mods":"","text":"中文","unshifted_codepoint":0,"composing":false,"action":"press"})
+        );
+    }
+
+    #[test]
+    fn unknown_named_key_is_none() {
+        assert!(to_rex_key(&KeyInput::new("launchmail")).is_none());
     }
 }
