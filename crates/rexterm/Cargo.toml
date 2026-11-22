@@ -7,3 +7,5 @@ license.workspace = true
 
 [dependencies]
 ghostty-vt.workspace = true
+gpui-kit.workspace = true
+gpui-cn = { path = "../../vendor/gpui-cn", features = ["ghostty", "jetbrains-mono"] }
