@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use rex_proto::control::Control;
 use rex_proto::testing::TestServer;
-use rexterm::rex::{BlockRef, RexSource, attach};
+use rexterm::rex::{BlockRef, RexSource, attach, recover};
 use rexterm::terminal::input::KeyInput;
 use rexterm::terminal::{FrameHandle, FrameSink, FrameSource, StartOptions, TerminalInput, TerminalSnapshot, Viewport};
 use serde_json::json;
@@ -122,4 +122,50 @@ fn server_resize_updates_grid() {
         .call("com.superlogical.terminal.resize", json!({"session_id": sid, "block_id": bid, "args": {"columns": 100, "rows": 30}}))
         .unwrap();
     wait_for(&r, "a 100x30 grid", |s| s.frame.viewport.columns() == 100 && s.frame.viewport.rows() == 30);
+}
+
+#[test]
+fn huge_paste_keeps_control_connection() {
+    let Some(srv) = TestServer::start() else { return };
+    let ctl = Control::connect(srv.endpoint.clone(), "rexa-desktop-test").unwrap();
+    let (sid, bid) = session(&ctl, Some(&["sh", "-c", "cat > /dev/null"]));
+    let r = start(&srv, &ctl, &sid, &bid);
+    let rx = ctl.events();
+    r.handle.input(TerminalInput::Paste("x\n".repeat(500_000))).unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    while let Ok(ev) = rx.try_recv() {
+        assert_ne!(ev["type"], "rexa_reconnecting", "the paste dropped the control connection");
+    }
+    assert!(ctl.call("server.version", json!({})).is_ok());
+}
+
+#[test]
+fn recover_after_new_client_restores_typing() {
+    let Some(srv) = TestServer::start() else { return };
+    let ctl = Control::connect(srv.endpoint.clone(), "rexa-desktop-test").unwrap();
+    let (sid, bid) = session(&ctl, None);
+    let rx = ctl.events();
+    ctl.reconnect_as_new_client_for_test();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "no reconnect");
+        if let Ok(ev) = rx.try_recv() && ev["type"] == "rexa_reconnected" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let block = BlockRef { endpoint: srv.endpoint.clone(), control: ctl.clone(), session_id: sid, block_id: bid };
+    let attached = recover(&block).expect("recover");
+    let (source, _events) = RexSource::new(block, attached);
+    let (sink, _wake) = FrameSink::new();
+    let handle = Box::new(source.engine())
+        .start(sink.clone(), StartOptions::default().with_viewport(Viewport::new(80, 24, 8, 16).unwrap()))
+        .unwrap();
+    let r = Running { sink, handle };
+    std::thread::sleep(Duration::from_millis(500));
+    for c in ["e", "c", "h", "o", " ", "'", "R", "'", "Y"] {
+        key(&r, if c == " " { "space" } else { c }, Some(c));
+    }
+    key(&r, "enter", None);
+    wait_for(&r, "RY", |s| s.frame.text().lines().any(|l| l.trim() == "RY"));
 }

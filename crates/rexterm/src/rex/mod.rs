@@ -3,7 +3,7 @@
 mod attach;
 pub mod keys;
 
-pub use attach::{AttachError, Attached, BlockRef, attach};
+pub use attach::{AttachError, Attached, BlockRef, attach, is_transient, recover};
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -179,6 +179,24 @@ impl Reader {
     }
 }
 
+/// `text` cut into pieces of at most `max` bytes, on character boundaries.
+fn paste_chunks(text: &str, max: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while rest.len() > max {
+        let mut at = max;
+        while !rest.is_char_boundary(at) {
+            at -= 1;
+        }
+        out.push(&rest[..at]);
+        rest = &rest[at..];
+    }
+    if !rest.is_empty() || out.is_empty() {
+        out.push(rest);
+    }
+    out
+}
+
 struct RexHandle {
     block: BlockRef,
     shared: Arc<Shared>,
@@ -260,8 +278,13 @@ impl ByteHandle for RexHandle {
                 self.block.control.send("client.key", p);
                 InputRoute::Handled
             }
+            // In pieces that fit the server's message limit (even if JSON escaping grows them
+            // sixfold); block.event calls stay in order.
             TerminalInput::Paste(s) => {
-                self.block_event(json!({"type": "paste", "payload": {"text": s}}));
+                let max = (self.block.control.max_message_bytes() / 8).max(1024) as usize;
+                for chunk in paste_chunks(s, max) {
+                    self.block_event(json!({"type": "paste", "payload": {"text": chunk}}));
+                }
                 InputRoute::Handled
             }
             TerminalInput::Focus(on) => {
@@ -271,5 +294,19 @@ impl ByteHandle for RexHandle {
             // Scrolling is local; pointer reporting goes to the program in a later milestone.
             _ => InputRoute::Encode,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paste_chunks_respect_limit_and_char_boundaries() {
+        let text = "中".repeat(1000) + &"a".repeat(1000);
+        let chunks = paste_chunks(&text, 100);
+        assert!(chunks.iter().all(|c| c.len() <= 100 && !c.is_empty()));
+        assert_eq!(chunks.concat(), text);
+        assert_eq!(paste_chunks("short", 100), vec!["short"]);
     }
 }

@@ -183,3 +183,22 @@ fn resume_continues_without_gap() {
         assert_eq!(*n, i as u64 + 1, "gap or duplicate at {i}");
     }
 }
+
+#[test]
+fn welcome_limit_is_exposed() {
+    let Some(srv) = TestServer::start() else { return };
+    let ctl = Control::connect(srv.endpoint.clone(), "rexa-desktop-test").unwrap();
+    assert_eq!(ctl.max_message_bytes(), 1 << 20);
+}
+
+#[test]
+fn new_client_hook_gives_unresumed_reconnect() {
+    let Some(srv) = TestServer::start() else { return };
+    let ctl = Control::connect(srv.endpoint.clone(), "rexa-desktop-test").unwrap();
+    let (sid, _) = session_with_block(&ctl);
+    let _ = sid;
+    let rx = ctl.events();
+    ctl.reconnect_as_new_client_for_test();
+    let ev = next_event(&rx, "rexa_reconnected", Duration::from_secs(10)).expect("no rexa_reconnected");
+    assert_eq!(ev["resumed"], false);
+}

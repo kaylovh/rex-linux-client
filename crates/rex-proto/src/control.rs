@@ -68,11 +68,14 @@ pub struct Control {
     pending: Mutex<HashMap<u64, mpsc::Sender<Reply>>>,
     next_id: AtomicU64,
     closing: AtomicBool,
+    /// The largest message the server accepts (the welcome's limits.max_message_bytes).
+    max_message: AtomicU64,
     events_tx: async_channel::Sender<Value>,
     events_rx: async_channel::Receiver<Value>,
 }
 
 struct Welcome {
+    max_message: u64,
     reader: WsReader,
     writer: WsWriter,
     client_id: String,
@@ -104,6 +107,7 @@ fn handshake(ep: &Endpoint, name: &str, token: Option<&str>) -> Result<Welcome, 
     }
     let client = &v["client"];    let client_id = client["id"].as_str().ok_or_else(|| ConnectError::NoWelcome(msg.clone()))?.to_string();
     Ok(Welcome {
+        max_message: v["limits"]["max_message_bytes"].as_u64().unwrap_or(1 << 20),
         reader,
         writer,
         client_id,
@@ -125,6 +129,7 @@ impl Control {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             closing: AtomicBool::new(false),
+            max_message: AtomicU64::new(w.max_message),
             events_tx,
             events_rx,
         });
@@ -176,6 +181,11 @@ impl Control {
         self.events_rx.clone()
     }
 
+    /// The largest message the server accepts; a bigger one closes the connection.
+    pub fn max_message_bytes(&self) -> u64 {
+        self.max_message.load(Ordering::Relaxed)
+    }
+
     pub fn client_id(&self) -> String {
         self.client_id.lock().unwrap().clone()
     }
@@ -185,6 +195,14 @@ impl Control {
         let w = self.writer.lock().unwrap().clone();
         let _ = w.close(1000);
         w.shutdown();
+    }
+
+    /// Drops the connection and forgets the reconnect token, so the server makes a new
+    /// client, as after a drop longer than the server keeps clients.
+    #[cfg(feature = "test-hooks")]
+    pub fn reconnect_as_new_client_for_test(&self) {
+        self.token.lock().unwrap().clear();
+        self.writer.lock().unwrap().shutdown();
     }
 
     #[cfg(feature = "test-hooks")]
@@ -268,6 +286,7 @@ impl Control {
             let changed = *self.client_id.lock().unwrap() != w.client_id;
             *self.writer.lock().unwrap() = w.writer;
             *self.token.lock().unwrap() = w.token;
+            self.max_message.store(w.max_message, Ordering::Relaxed);
             *self.client_id.lock().unwrap() = w.client_id;
             self.emit(json!({"type": "rexa_reconnected", "resumed": w.resumed && !changed}));
             return Some(w.reader);

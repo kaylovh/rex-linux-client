@@ -198,11 +198,15 @@ impl Endpoint {
                 let last_err = Arc::new(Mutex::new(String::new()));
                 {
                     let last_err = last_err.clone();
+                    // Line by line: an ssh master kept alive by ControlPersist holds stderr
+                    // open, so waiting for EOF would never show the reason.
                     std::thread::spawn(move || {
-                        let mut buf = String::new();
-                        let _ = io::BufReader::new(stderr).read_to_string(&mut buf);
-                        if let Some(l) = buf.lines().rev().find(|l| !l.trim().is_empty()) {
-                            *last_err.lock().unwrap() = l.trim().to_string();
+                        use std::io::BufRead;
+                        for line in io::BufReader::new(stderr).lines() {
+                            let Ok(line) = line else { break };
+                            if !line.trim().is_empty() {
+                                *last_err.lock().unwrap() = line.trim().to_string();
+                            }
                         }
                     });
                 }
@@ -325,6 +329,20 @@ mod tests {
         };
         assert!(start.elapsed() < Duration::from_secs(2));
         assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn exit_reason_shows_even_if_stderr_stays_open() {
+        // Like an ssh master left running by ControlPersist: a child keeps stderr open.
+        let ep = Endpoint::parse("cmd:sh -c 'echo rex: command not found >&2; sleep 5 >/dev/null & exit 127'").unwrap();
+        let start = Instant::now();
+        let stream = ep.connect(Duration::from_secs(10)).unwrap();
+        let err = match crate::ws::connect(stream, "/api/control", "rex.control.v1") {
+            Err(e) => e,
+            Ok(_) => panic!("connected"),
+        };
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(err.to_string().contains("command not found"), "{err}");
     }
 
     #[test]

@@ -67,3 +67,26 @@ pub fn attach(block: &BlockRef) -> Result<Attached, AttachError> {
         }
     }
 }
+
+/// Attaches the control connection to the block's session again, then opens the stream:
+/// what a client the server no longer knows (a long drop, a server restart) needs before
+/// keys and data reach the block again.
+pub fn recover(block: &BlockRef) -> Result<Attached, AttachError> {
+    block
+        .control
+        .call("session.attach", serde_json::json!({"session_id": block.session_id}))
+        .map_err(AttachError::Call)?;
+    attach(block)
+}
+
+/// Whether trying again later can help (the connection is down or busy), as opposed to the
+/// session or block being gone.
+pub fn is_transient(e: &AttachError) -> bool {
+    match e {
+        AttachError::Call(CallError::Closed | CallError::Timeout) => true,
+        AttachError::Call(CallError::Remote { code, .. }) => !matches!(code.as_str(), "not_found" | "session_not_found"),
+        AttachError::Data(DataError::Io(_) | DataError::Limit | DataError::ServerFailed) => true,
+        AttachError::Data(_) | AttachError::NoTicket => true,
+        AttachError::Closed(code) => *code != 4000,
+    }
+}

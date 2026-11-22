@@ -7,7 +7,9 @@ use std::sync::Arc;
 use gpui_kit::*;
 use rex_proto::control::Control;
 use rex_proto::transport::Endpoint;
-use rexterm::rex::{Attached, BlockRef, RexEvent, RexSource, attach};
+use std::time::Duration;
+
+use rexterm::rex::{Attached, BlockRef, RexEvent, RexSource, attach, is_transient, recover};
 use rexterm::terminal::{Terminal, TerminalConfig, TerminalState, default_key_bindings};
 use serde_json::{Value, json};
 
@@ -102,6 +104,7 @@ enum Status {
     Connecting,
     Live,
     Reconnecting,
+    Exited(i64),
     Closed,
     Failed(String),
 }
@@ -113,6 +116,7 @@ impl Status {
             Status::Connecting => Some(t("Connecting…", "正在连接…").into()),
             Status::Reconnecting => Some(t("Reconnecting…", "正在重连…").into()),
             Status::Closed => Some(t("Block closed", "这个 block 已关闭").into()),
+            Status::Exited(code) => Some(format!("{} {code}", t("Program exited with code", "程序已退出,退出码"))),
             Status::Failed(why) => Some(format!("{}{why}", t("Can't connect: ", "连不上:"))),
         }
     }
@@ -122,6 +126,8 @@ struct Main {
     status: Status,
     terminal: Option<Entity<TerminalState>>,
     block: Option<BlockRef>,
+    /// A recovery (re-attach and reopen the stream) is running.
+    recovering: bool,
     tasks: Vec<Task<()>>,
 }
 
@@ -139,7 +145,7 @@ impl Main {
                 Err(why) => this.set_status(Status::Failed(why), cx),
             });
         });
-        Main { status: Status::Connecting, terminal: None, block: None, tasks: vec![task] }
+        Main { status: Status::Connecting, terminal: None, block: None, recovering: false, tasks: vec![task] }
     }
 
     fn set_status(&mut self, status: Status, cx: &mut Context<Self>) {
@@ -171,37 +177,70 @@ impl Main {
 
     fn on_rex_event(&mut self, ev: RexEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
-            RexEvent::Reattach => {
-                let Some(block) = self.block.clone() else { return };
-                self.set_status(Status::Reconnecting, cx);
-                self.tasks.push(cx.spawn_in(window, async move |this, cx| {
-                    let b = block.clone();
-                    let result = cx.background_spawn(async move { attach(&b) }).await;
-                    let _ = this.update_in(cx, |this, window, cx| match result {
-                        Ok(attached) => this.show(block, attached, window, cx),
-                        Err(e) => this.set_status(Status::Failed(e.to_string()), cx),
-                    });
-                }));
-            }
+            RexEvent::Reattach => self.recover(window, cx),
             RexEvent::BlockClosed => self.set_status(Status::Closed, cx),
-            // M0 keeps gpui-cn's default colours and shows an exited program's last screen.
-            RexEvent::Exited(_) | RexEvent::Theme(_) => {}
+            RexEvent::Exited(code) => self.set_status(Status::Exited(code), cx),
+            // M0 keeps gpui-cn's default colours.
+            RexEvent::Theme(_) => {}
         }
+    }
+
+    /// Re-attaches the session and reopens the stream, retrying while the server is
+    /// unreachable, until it works or the session or block is gone.
+    fn recover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(block) = self.block.clone() else { return };
+        if self.recovering || self.status == Status::Closed {
+            return;
+        }
+        self.recovering = true;
+        self.set_status(Status::Reconnecting, cx);
+        self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+            let mut delay = Duration::from_millis(500);
+            loop {
+                let b = block.clone();
+                let result = cx.background_spawn(async move { recover(&b) }).await;
+                match result {
+                    Ok(attached) => {
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            this.recovering = false;
+                            this.show(block, attached, window, cx);
+                        });
+                        return;
+                    }
+                    Err(e) if is_transient(&e) => {
+                        cx.background_executor().timer(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(5));
+                    }
+                    Err(e) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.recovering = false;
+                            this.set_status(Status::Failed(e.to_string()), cx);
+                        });
+                        return;
+                    }
+                }
+            }
+        }));
     }
 
     fn watch_control(&mut self, control: Arc<Control>, window: &mut Window, cx: &mut Context<Self>) {
         let events = control.events();
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
             while let Ok(ev) = events.recv().await {
-                let status = match ev["type"].as_str() {
-                    Some("rexa_reconnecting") => Some(Status::Reconnecting),
-                    Some("rexa_reconnected") => Some(Status::Live),
-                    Some("rexa_disconnected") => Some(Status::Failed(t("disconnected", "连接已断开").into())),
-                    _ => None,
-                };
-                if let Some(s) = status
-                    && this.update(cx, |this, cx| this.set_status(s, cx)).is_err()
-                {
+                let alive = this.update_in(cx, |this, window, cx| match ev["type"].as_str() {
+                    Some("rexa_reconnecting") if this.status == Status::Live => this.set_status(Status::Reconnecting, cx),
+                    // The server still knew this client: attachments and streams carry on.
+                    Some("rexa_reconnected") if ev["resumed"] == true => {
+                        if this.status == Status::Reconnecting && !this.recovering {
+                            this.set_status(Status::Live, cx);
+                        }
+                    }
+                    // A new client (gone too long, or the server restarted): attach again.
+                    Some("rexa_reconnected") => this.recover(window, cx),
+                    Some("rexa_disconnected") => this.set_status(Status::Failed(t("disconnected", "连接已断开").into()), cx),
+                    _ => {}
+                });
+                if alive.is_err() {
                     break;
                 }
             }
