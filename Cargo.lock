@@ -6785,6 +6785,7 @@ dependencies = [
 name = "rex-client"
 version = "1.0.0-dev"
 dependencies = [
+ "rex-proto",
  "serde_json",
 ]
 

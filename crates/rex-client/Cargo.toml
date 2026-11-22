@@ -7,3 +7,6 @@ license.workspace = true
 
 [dependencies]
 serde_json.workspace = true
+
+[dev-dependencies]
+rex-proto = { path = "../rex-proto", features = ["test-hooks"] }
