@@ -6782,6 +6782,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rex-client"
+version = "1.0.0-dev"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "rex-proto"
 version = "1.0.0-dev"
 dependencies = [
