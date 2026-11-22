@@ -19,3 +19,4 @@ test-hooks = []
 
 [dev-dependencies]
 rex-proto = { path = ".", features = ["test-hooks"] }
+ghostty-vt.workspace = true

@@ -1,6 +1,8 @@
 //! The Rex client protocol: control and data connections over a unix socket or an ssh bridge.
 
 pub mod control;
+pub mod data;
+pub mod scan;
 #[cfg(feature = "test-hooks")]
 pub mod testing;
 pub mod transport;
