@@ -50,6 +50,16 @@ pub struct Settings {
     pub shown_hosts: Vec<ShownHosts>,
 }
 
+/// The file panel as it was left.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FilesState {
+    pub open: bool,
+    /// Pinned to (machine key, folder); None: following the terminal.
+    pub pinned: Option<(String, String)>,
+    pub show_hidden: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkspaceState {
@@ -58,6 +68,9 @@ pub struct WorkspaceState {
     pub sidebar_open: bool,
     pub sidebar_width: Option<f32>,
     pub window_size: Option<(f32, f32)>,
+    pub files: FilesState,
+    /// Open previews as (machine key, path).
+    pub previews: Vec<(String, String)>,
 }
 
 impl Default for FontSettings {
@@ -73,7 +86,7 @@ impl Default for FontSettings {
 
 impl Default for WorkspaceState {
     fn default() -> Self {
-        Self { machine: None, session: None, sidebar_open: true, sidebar_width: None, window_size: None }
+        Self { machine: None, session: None, sidebar_open: true, sidebar_width: None, window_size: None, files: FilesState::default(), previews: Vec::new() }
     }
 }
 
@@ -211,6 +224,21 @@ mod tests {
         let names: Vec<String> = fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
         assert_eq!(load_state(&d).session.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn files_state_round_trip() {
+        let d = tmp("filesstate");
+        let s = WorkspaceState {
+            files: FilesState { open: true, pinned: Some(("m:dev".into(), "/srv/app".into())), show_hidden: true },
+            previews: vec![("local".into(), "/etc/hosts".into())],
+            ..Default::default()
+        };
+        save_state(&d, &s).unwrap();
+        assert_eq!(load_state(&d), s);
+        // An old state file without them loads with the panel closed.
+        fs::write(d.join("state.json"), r#"{"machine":"local"}"#).unwrap();
+        assert_eq!(load_state(&d).files, FilesState::default());
     }
 
     #[test]

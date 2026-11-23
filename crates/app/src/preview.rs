@@ -103,8 +103,8 @@ struct Tab {
 }
 
 pub enum PreviewEvent {
-    /// The last tab was closed.
-    Empty,
+    /// A tab was closed (the list of open files changed).
+    Closed,
 }
 
 /// Previews of opened files, one tab each.
@@ -192,9 +192,7 @@ impl PreviewPanel {
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
         }
-        if self.tabs.is_empty() {
-            cx.emit(PreviewEvent::Empty);
-        }
+        cx.emit(PreviewEvent::Closed);
         cx.notify();
     }
 }

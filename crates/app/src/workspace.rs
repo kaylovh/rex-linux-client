@@ -24,7 +24,7 @@ use rexterm::terminal::input::{KeyInput, Modifiers};
 use rexterm::terminal::{Terminal, TerminalState};
 use serde_json::{Value, json};
 
-use crate::config::{self, Settings, WorkspaceState};
+use crate::config::{self, FilesState, Settings, WorkspaceState};
 use crate::hosts::{HostEntry, machines_with_hosts, parse_hosts, shown_by_default};
 use crate::i18n::t;
 use crate::keys::gui_command;
@@ -197,6 +197,11 @@ pub struct Workspace {
     modal: Modal,
     files: Entity<FilePanel>,
     files_open: bool,
+    /// Restored once their machine connects: the pinned folder, the open previews.
+    pending_pin: Option<(String, String)>,
+    pending_previews: Vec<(String, String)>,
+    /// The pin being restored, saved as is until the panel shows it.
+    pin_target: Option<(String, String)>,
     preview: Entity<PreviewPanel>,
     /// What the file panel shows when following: (machine, source, folder).
     last_follow: Option<(String, Source, Option<String>)>,
@@ -229,10 +234,18 @@ impl Workspace {
         let palette = cx.new(|cx| CommandState::new(t("Type a command or a session…", "输入命令或 session…"), window, cx));
         let files = cx.new(|cx| FilePanel::new(window, cx));
         let preview = cx.new(|_| PreviewPanel::new());
-        cx.subscribe_in(&preview, window, |_, _, ev: &PreviewEvent, _, cx| match ev {
-            PreviewEvent::Empty => cx.notify(),
+        cx.subscribe_in(&preview, window, |this, _, ev: &PreviewEvent, window, cx| match ev {
+            PreviewEvent::Closed => {
+                this.save_state(window, cx);
+                cx.notify();
+            }
         })
         .detach();
+        let files_state = init.state.files.clone();
+        files.update(cx, |f, cx| {
+            f.set_show_hidden(files_state.show_hidden, cx);
+            f.set_pinned(files_state.pinned.is_some(), cx);
+        });
         cx.subscribe_in(&files, window, Self::on_files_event).detach();
         cx.subscribe_in(&palette, window, |this, _, ev: &CommandEvent, window, cx| {
             if let CommandEvent::Confirmed(key) = ev {
@@ -270,7 +283,10 @@ impl Workspace {
             fetching_view: false,
             modal: Modal::None,
             files,
-            files_open: false,
+            files_open: files_state.open,
+            pending_pin: files_state.pinned,
+            pending_previews: init.state.previews.clone(),
+            pin_target: None,
             preview,
             last_follow: None,
             files_source: None,
@@ -408,6 +424,7 @@ impl Workspace {
                 // syncing hosts: that sync may open the start session on it.
                 let was_shown = self.shown.as_deref() == Some(key);
                 self.sync_hosts(window, cx);
+                self.restore_files_for(key, window, cx);
                 if was_shown {
                     // The shown machine connected anew (Retry after a drop): its old panes
                     // belong to the closed connection; show the same session again.
@@ -523,7 +540,23 @@ impl Workspace {
         let sid = self.sid();
         let shown = self.shown.as_deref().map(|m| (m, sid.as_deref()));
         let (machine, session) = state_target(shown, (self.saved.0.as_deref(), self.saved.1.as_deref()), self.automatic);
+        let panel = self.files.read(cx);
+        let pinned = if panel.pinned() {
+            panel
+                .machine()
+                .zip(panel.root())
+                .map(|(m, r)| (m.to_string(), r.to_string()))
+                .or_else(|| self.pending_pin.clone())
+                .or_else(|| self.pin_target.clone())
+        } else {
+            None
+        };
+        let files = FilesState { open: self.files_open, pinned, show_hidden: panel.show_hidden() };
+        let mut previews = self.preview.read(cx).files();
+        previews.extend(self.pending_previews.iter().cloned());
         let state = WorkspaceState {
+            files,
+            previews,
             machine,
             session,
             sidebar_open: sb.is_open(),
@@ -927,6 +960,7 @@ impl Workspace {
                 self.last_follow = None;
                 self.refresh_file_machines(cx);
                 self.follow(window, cx);
+                self.save_state(window, cx);
                 cx.notify();
                 return;
             }
@@ -1459,11 +1493,17 @@ impl Workspace {
                 let source = source_for_machine(&m.spec, m.host_id.as_deref(), self.local_host_id().as_deref());
                 let (key, name) = (m.spec.key.clone(), m.spec.name.clone());
                 self.last_follow = None;
+                self.pending_pin = None;
+                self.pin_target = None;
                 self.show_files(key, name, source, None, window, cx);
+                self.save_state(window, cx);
             }
             PanelEvent::Follow => {
                 self.last_follow = None;
+                self.pending_pin = None;
+                self.pin_target = None;
                 self.follow(window, cx);
+                self.save_state(window, cx);
             }
         }
     }
@@ -1472,7 +1512,58 @@ impl Workspace {
         let panel = self.files.read(cx);
         let (Some(machine), Some(fs)) = (panel.machine().map(str::to_string), panel.fs()) else { return };
         self.preview.update(cx, |p, cx| p.open(machine, path, fs, window, cx));
+        self.save_state(window, cx);
         cx.notify();
+    }
+
+    /// After `key` connects: the pinned folder and the previews that were open on it.
+    fn restore_files_for(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(m) = self.machine(key) else { return };
+        let source = source_for_machine(&m.spec, m.host_id.as_deref(), self.local_host_id().as_deref());
+        let name = m.spec.name.clone();
+        if let Some((pm, dir)) = self.pending_pin.clone()
+            && pm == key
+        {
+            self.pending_pin = None;
+            self.pin_target = Some((pm, dir.clone()));
+            self.files.update(cx, |f, cx| f.set_pinned(true, cx));
+            self.show_files(key.to_string(), name, source.clone(), Some(dir), window, cx);
+        }
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_previews).into_iter().partition(|(m, _)| m == key);
+        self.pending_previews = rest;
+        for (_, path) in mine {
+            match &source {
+                Source::Local => {
+                    let fs = self.local_fs.clone();
+                    self.preview.update(cx, |p, cx| p.open(key.to_string(), path, fs, window, cx));
+                }
+                Source::Sftp { address } => {
+                    let (address, key) = (address.clone(), key.to_string());
+                    let cached = self.sftp.get(&address).cloned();
+                    self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+                        let fs = match cached {
+                            Some(fs) => Ok(fs),
+                            None => {
+                                let a = address.clone();
+                                cx.background_spawn(async move {
+                                    let argv = rex_proto::transport::sftp_command(&a).ok_or(files::FsError::NotFound)?;
+                                    files::sftp::SftpFs::spawn(argv).map(|s| Arc::new(s) as Arc<dyn files::FileSystem>)
+                                })
+                                .await
+                            }
+                        };
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            if let Ok(fs) = fs {
+                                this.sftp.entry(address).or_insert_with(|| fs.clone());
+                                this.preview.update(cx, |p, cx| p.open(key, path, fs, window, cx));
+                            }
+                        });
+                    }));
+                }
+                // Previews read through a terminal can't come back without one.
+                _ => {}
+            }
+        }
     }
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
