@@ -3,6 +3,8 @@
 
 use rex_proto::transport::Endpoint;
 
+use rex_client::model::SessionInfo;
+
 use crate::config::{MachineConfig, Settings, WorkspaceState};
 use crate::i18n::t;
 
@@ -106,6 +108,67 @@ impl MachineError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartChoice {
+    Open(String),
+    /// The session named on the command line isn't there.
+    Missing(String),
+    Create,
+}
+
+/// The session `wanted` names: by label or id (an id suffix of 6+ characters works).
+pub fn find_session(sessions: &[SessionInfo], wanted: &str) -> Option<String> {
+    sessions
+        .iter()
+        .find(|s| s.label == wanted || s.id == wanted || (wanted.len() >= 6 && s.id.ends_with(wanted)))
+        .map(|s| s.id.clone())
+}
+
+/// What to open on the start machine: the wanted session; else (unless it was named on the
+/// command line) the first; else a new one.
+pub fn start_choice(sessions: &[SessionInfo], wanted: Option<&str>, strict: bool) -> StartChoice {
+    if let Some(w) = wanted {
+        if let Some(id) = find_session(sessions, w) {
+            return StartChoice::Open(id);
+        }
+        if strict {
+            return StartChoice::Missing(w.to_string());
+        }
+    }
+    match sessions.first() {
+        Some(s) => StartChoice::Open(s.id.clone()),
+        None => StartChoice::Create,
+    }
+}
+
+/// The session to show after the shown machine connected anew: the one shown before if it
+/// is still there, else the first.
+pub fn after_reconnect(sessions: &[SessionInfo], previous: Option<&str>) -> Option<String> {
+    previous
+        .and_then(|p| sessions.iter().find(|s| s.id == p))
+        .or(sessions.first())
+        .map(|s| s.id.clone())
+}
+
+/// The machine and session to remember: what is shown once the user has chosen it; until
+/// then (an automatic fallback, or nothing shown yet) the ones saved before.
+pub fn state_target(shown: Option<(&str, Option<&str>)>, saved: (Option<&str>, Option<&str>), automatic: bool) -> (Option<String>, Option<String>) {
+    match shown {
+        Some((m, Some(s))) if !automatic => (Some(m.to_string()), Some(s.to_string())),
+        _ => (saved.0.map(str::to_string), saved.1.map(str::to_string)),
+    }
+}
+
+/// The status line: the prefix hint alone; else a message, the shown machine's connection
+/// state and the standing notices.
+pub fn status_line(prefix: Option<&str>, banner: Option<&str>, conn: Option<&str>, notices: &[String]) -> Option<String> {
+    if let Some(p) = prefix {
+        return Some(p.to_string());
+    }
+    let parts: Vec<&str> = banner.into_iter().chain(conn).chain(notices.iter().map(String::as_str)).collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +236,51 @@ mod tests {
         assert_eq!(start_target(&specs, &gone, None), ("local".into(), None));
         assert_eq!(start_target(&specs, &saved, Some("work")), ("local".into(), Some("work".into())));
         assert_eq!(start_target(&specs, &WorkspaceState::default(), None), ("local".into(), None));
+    }
+
+
+    fn si(id: &str, label: &str) -> SessionInfo {
+        SessionInfo { id: id.into(), label: label.into() }
+    }
+
+    #[test]
+    fn start_choice_rules() {
+        let s = vec![si("session:aaaa-111111", "work"), si("session:bbbb-222222", "ai")];
+        assert_eq!(start_choice(&s, Some("ai"), true), StartChoice::Open("session:bbbb-222222".into()));
+        assert_eq!(start_choice(&s, Some("111111"), false), StartChoice::Open("session:aaaa-111111".into()));
+        assert_eq!(start_choice(&s, Some("nope"), true), StartChoice::Missing("nope".into()));
+        assert_eq!(start_choice(&s, Some("nope"), false), StartChoice::Open("session:aaaa-111111".into()));
+        assert_eq!(start_choice(&s, None, false), StartChoice::Open("session:aaaa-111111".into()));
+        assert_eq!(start_choice(&[], None, false), StartChoice::Create);
+    }
+
+    #[test]
+    fn reconnect_keeps_the_shown_session() {
+        let s = vec![si("s1", "a"), si("s2", "b")];
+        assert_eq!(after_reconnect(&s, Some("s2")), Some("s2".into()));
+        assert_eq!(after_reconnect(&s, Some("gone")), Some("s1".into()));
+        assert_eq!(after_reconnect(&[], Some("s2")), None);
+    }
+
+    #[test]
+    fn saved_target_survives_automatic_choices() {
+        let saved = (Some("m:dev"), Some("s9"));
+        // Fell back to this computer while dev was unreachable: keep dev.
+        assert_eq!(state_target(Some(("local", Some("s1"))), saved, true), (Some("m:dev".into()), Some("s9".into())));
+        // Nothing shown yet (closing while connecting): keep dev.
+        assert_eq!(state_target(None, saved, false), (Some("m:dev".into()), Some("s9".into())));
+        // The user chose: save it.
+        assert_eq!(state_target(Some(("local", Some("s1"))), saved, false), (Some("local".into()), Some("s1".into())));
+    }
+
+    #[test]
+    fn status_line_priority() {
+        let notes = vec!["settings broken".to_string()];
+        assert_eq!(status_line(None, None, None, &notes).as_deref(), Some("settings broken"));
+        assert_eq!(status_line(None, Some("can't open"), None, &notes).as_deref(), Some("can't open · settings broken"));
+        assert_eq!(status_line(None, None, Some("reconnecting…"), &[]).as_deref(), Some("reconnecting…"));
+        assert_eq!(status_line(Some("Ctrl-b …"), Some("x"), Some("y"), &notes).as_deref(), Some("Ctrl-b …"));
+        assert_eq!(status_line(None, None, None, &[]), None);
     }
 
     #[test]

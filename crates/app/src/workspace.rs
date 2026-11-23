@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use crate::config::{self, Settings, WorkspaceState};
 use crate::i18n::t;
 use crate::keys::gui_command;
-use crate::machines::{ConnState, MachineSpec};
+use crate::machines::{ConnState, MachineSpec, StartChoice, after_reconnect, start_choice, state_target, status_line};
 use crate::palette::{PaletteAction, PaletteEntry, PaletteSession, palette_entries, session_name};
 use crate::machines::machine_specs;
 use crate::panes::{PaneEntry, PaneSet, PaneStatus, diff};
@@ -52,14 +52,6 @@ fn connect(endpoint: rex_proto::transport::Endpoint) -> Result<(Arc<Control>, Ve
     // Every session's events (status badges for the sessions not shown too).
     let _ = control.call("session.attach_all", json!({"event_scope": "all"}));
     Ok((control, sessions))
-}
-
-/// The session `wanted` names: by label or id (an id suffix of 6+ characters works).
-fn find_session(sessions: &[SessionInfo], wanted: &str) -> Option<String> {
-    sessions
-        .iter()
-        .find(|s| s.label == wanted || s.id == wanted || (wanted.len() >= 6 && s.id.ends_with(wanted)))
-        .map(|s| s.id.clone())
 }
 
 /// The program status records of every terminal block in every session, for the sidebar.
@@ -156,6 +148,12 @@ pub struct Workspace {
     sidebar: Entity<SidebarState>,
     /// A message for the whole window (connecting, failed).
     banner: Option<String>,
+    /// Standing warnings (a broken settings file, skipped machines), until clicked away or the settings are saved.
+    notices: Vec<String>,
+    /// The machine and session saved when the app was last closed.
+    saved: (Option<String>, Option<String>),
+    /// What is shown was picked by the app (start, fallback), not by the user: keep `saved`.
+    automatic: bool,
     prefix: bool,
     area: Rc<Cell<Bounds<Pixels>>>,
     /// The border being dragged: (before block, after block, direction) and the ratio under the pointer.
@@ -186,7 +184,6 @@ impl Workspace {
                 w.update(cx, |w, cx| w.on_keystroke(ev, window, cx));
             }
         });
-        let banner = (!init.notices.is_empty()).then(|| init.notices.join(" · "));
         let palette = cx.new(|cx| CommandState::new(t("Type a command or a session…", "输入命令或 session…"), window, cx));
         cx.subscribe_in(&palette, window, |this, _, ev: &CommandEvent, window, cx| {
             if let CommandEvent::Confirmed(key) = ev {
@@ -212,7 +209,10 @@ impl Workspace {
             panes: PaneSet::default(),
             tabs: tabs.clone(),
             sidebar,
-            banner,
+            banner: None,
+            notices: init.notices,
+            saved: (init.state.machine.clone(), init.state.session.clone()),
+            automatic: true,
             prefix: false,
             area: Rc::new(Cell::new(Bounds::default())),
             drag: None,
@@ -319,6 +319,7 @@ impl Workspace {
             }
             Ok((control, sessions)) => {
                 m.conn = ConnState::Connected;
+                let previous = m.model.current.take();
                 m.model = SessionModel::default();
                 m.model.sessions = sessions.clone();
                 m.control = Some(control.clone());
@@ -344,7 +345,18 @@ impl Workspace {
                         cx.notify();
                     });
                 }));
-                self.maybe_start(key, window, cx);
+                if self.shown.as_deref() == Some(key) {
+                    // The shown machine connected anew (Retry after a drop): its old panes
+                    // belong to the closed connection; show the same session again.
+                    self.leave(window, cx);
+                    let sessions = self.machine(key).map(|m| m.model.sessions.clone()).unwrap_or_default();
+                    match after_reconnect(&sessions, previous.as_deref()) {
+                        Some(id) => self.open_session(id, window, cx),
+                        None => self.banner = Some(t("No sessions. Press Ctrl-b N for a new one.", "没有 session。按 Ctrl-b N 新建。").into()),
+                    }
+                } else {
+                    self.maybe_start(key, window, cx);
+                }
             }
         }
         cx.notify();
@@ -362,32 +374,31 @@ impl Workspace {
             return;
         }
         let Some(m) = self.machine(key) else { return };
-        let wanted = start.session.as_deref().and_then(|w| find_session(&m.model.sessions, w));
-        let strict = start.strict;
-        let missing = start.session.clone().filter(|_| wanted.is_none());
-        let first = m.model.sessions.first().map(|s| s.id.clone());
+        let planned = start.machine.as_deref() == Some(key);
+        let choice = start_choice(&m.model.sessions, start.session.as_deref(), start.strict);
         self.start = None;
-        match (wanted, missing) {
-            (Some(id), _) => self.open(key.to_string(), id, window, cx),
-            (None, Some(w)) if strict => {
-                self.banner = Some(format!("{} \"{w}\"", t("no session matches", "没有匹配的 session")));
-            }
-            _ => match first {
-                Some(id) => self.open(key.to_string(), id, window, cx),
-                None => self.new_session(key.to_string(), window, cx),
-            },
+        match choice {
+            StartChoice::Open(id) => self.show(key.to_string(), id, !planned, window, cx),
+            StartChoice::Missing(w) => self.banner = Some(format!("{} \"{w}\"", t("no session matches", "没有匹配的 session"))),
+            StartChoice::Create => self.new_session(key.to_string(), window, cx),
         }
     }
 
     // ---- sessions ---------------------------------------------------------------------
 
-    /// Shows `sid` of machine `key`, leaving whatever was shown.
+    /// Shows `sid` of machine `key`, leaving whatever was shown: the user's choice.
     fn open(&mut self, key: String, sid: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.show(key, sid, false, window, cx);
+    }
+
+    /// Shows a session; `automatic`: the app picked it (keep the saved one in the state).
+    fn show(&mut self, key: String, sid: String, automatic: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.shown.as_deref() == Some(key.as_str()) && self.sid().as_deref() == Some(sid.as_str()) {
             return;
         }
         self.leave(window, cx);
         self.shown = Some(key);
+        self.automatic = automatic;
         self.open_session(sid, window, cx);
         self.save_state(window, cx);
     }
@@ -446,9 +457,12 @@ impl Workspace {
         let (Some(dir), true) = (&self.config, self.save_enabled) else { return };
         let sb = self.sidebar.read(cx);
         let size = window.bounds().size;
+        let sid = self.sid();
+        let shown = self.shown.as_deref().map(|m| (m, sid.as_deref()));
+        let (machine, session) = state_target(shown, (self.saved.0.as_deref(), self.saved.1.as_deref()), self.automatic);
         let state = WorkspaceState {
-            machine: self.shown.clone(),
-            session: self.sid(),
+            machine,
+            session,
             sidebar_open: sb.is_open(),
             sidebar_width: Some(f32::from(sb.width())),
             window_size: Some((f32::from(size.width), f32::from(size.height))),
@@ -1082,6 +1096,7 @@ impl Workspace {
             config::save_settings(dir, &s, self.settings_broken).map_err(|e| format!("{}{e}", t("Can't save the settings: ", "无法保存设置:")))?;
         }
         self.settings_broken = false;
+        self.notices.clear();
         crate::i18n::set_language(s.language);
         let font_changed = s.font != self.settings.font;
         self.settings = s;
@@ -1398,11 +1413,9 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let status = if self.prefix {
-            Some(t("Ctrl-b … (press a key: c new tab, % split, z zoom)", "Ctrl-b …(再按一个键:c 新 tab、% 分屏、z 放大)").to_string())
-        } else {
-            self.banner.clone()
-        };
+        let prefix = self.prefix.then(|| t("Ctrl-b … (press a key: c new tab, % split, z zoom, : palette)", "Ctrl-b …(再按一个键:c 新 tab、% 分屏、z 放大、: 命令面板)"));
+        let conn = self.shown_machine().and_then(|m| m.conn.text().map(|s| format!("{}: {s}", m.spec.name)));
+        let status = status_line(prefix, self.banner.as_deref(), conn.as_deref(), &self.notices);
         let main = div()
             .size_full()
             .flex()
@@ -1410,7 +1423,23 @@ impl Render for Workspace {
             .bg(rgb(0x1e1e1e))
             .child(div().flex_none().h(px(40.)).overflow_hidden().child(Tabs::new("tabs", &self.tabs).renamable(true).confirm_close(true).addable(true)))
             .child(self.render_panes(cx))
-            .when_some(status, |d, s| d.child(div().px_3().py_1().bg(rgb(0x3a3a3a)).text_color(rgb(0xe0e0e0)).text_sm().child(s)));
+            .when_some(status, |d, s| {
+                d.child(
+                    div()
+                        .id("status-line")
+                        .px_3()
+                        .py_1()
+                        .bg(rgb(0x3a3a3a))
+                        .text_color(rgb(0xe0e0e0))
+                        .text_sm()
+                        .child(s)
+                        // A click puts the standing notices away.
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.notices.clear();
+                            cx.notify();
+                        })),
+                )
+            });
         div()
             .size_full()
             .relative()

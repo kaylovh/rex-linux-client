@@ -18,7 +18,7 @@ pub fn terminal_config(font: &FontSettings) -> TerminalConfig {
     if let Some(f) = &font.family {
         a = a.with_font_family(f.clone());
     }
-    if let Some(s) = font.size {
+    if let Some(s) = font.size.filter(|s| (6.0..=72.0).contains(s)) {
         a = a.with_font_size(px(s));
     }
     if !font.fallbacks.is_empty() {
@@ -232,6 +232,10 @@ mod tests {
         let d = terminal_config(&FontSettings { family: None, size: None, fallbacks: vec![] });
         assert_eq!(d.appearance().font_family(), None);
         assert_eq!(d.appearance().font_size(), None);
+        // A hand-edited size outside 6–72 is ignored.
+        for bad in [0.0, -4.0, 500.0, f32::NAN] {
+            assert_eq!(terminal_config(&FontSettings { family: None, size: Some(bad), fallbacks: vec![] }).appearance().font_size(), None);
+        }
     }
 
     #[test]
