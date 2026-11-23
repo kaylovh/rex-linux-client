@@ -40,7 +40,7 @@ pub fn session_name(id: &str, label: &str) -> String {
 
 pub fn palette_entries(sessions: &[PaletteSession], machines: &[(&str, &str)], has_session: bool) -> Vec<PaletteEntry> {
     use Command::*;
-    let commands: [(Command, &str, &str, Option<&str>, bool); 12] = [
+    let commands: [(Command, &str, &str, Option<&str>, bool); 13] = [
         (NewTab, "New tab", "新建 tab", Some("c"), true),
         (SplitRight, "Split right", "向右分屏", Some("%"), true),
         (SplitDown, "Split down", "向下分屏", Some("\""), true),
@@ -53,6 +53,7 @@ pub fn palette_entries(sessions: &[PaletteSession], machines: &[(&str, &str)], h
         (NewSession, "New session", "新建 session", Some("N"), false),
         (ToggleSidebar, "Toggle sidebar", "显示/隐藏侧栏", Some("s"), false),
         (Settings, "Settings", "设置", None, false),
+        (ServerInfo, "Server info", "服务端信息", Some("S"), false),
     ];
     let mut out = Vec::new();
     for (cmd, en, zh, key, needs_session) in commands {
@@ -100,6 +101,7 @@ mod tests {
         assert!(!has(PaletteAction::Run(Command::SplitRight)));
         assert!(!has(PaletteAction::Run(Command::ClosePane)));
         assert!(has(PaletteAction::Run(Command::Settings)));
+        assert!(has(PaletteAction::Run(Command::ServerInfo)));
         assert!(has(PaletteAction::NewSession("local".into())));
         let e = palette_entries(&[], &[("local", "This computer")], true);
         assert!(e.iter().any(|x| x.action == PaletteAction::Run(Command::SplitRight) && x.hint.as_deref() == Some("Ctrl-b %")));

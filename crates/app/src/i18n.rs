@@ -14,6 +14,10 @@ pub fn zh_from(get: impl Fn(&str) -> Option<String>) -> bool {
         .is_some_and(|v| v.starts_with("zh"))
 }
 
+/// Tests that change the language hold this, so they don't race.
+#[cfg(test)]
+pub static TEST_LANG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 0 follows the locale, 1 English, 2 Chinese.
 static CHOSEN: AtomicU8 = AtomicU8::new(0);
 
@@ -51,6 +55,7 @@ mod tests {
 
     #[test]
     fn language_override() {
+        let _lang = TEST_LANG.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         set_language(Language::Zh);
         assert_eq!(t("a", "乙"), "乙");
         set_language(Language::En);

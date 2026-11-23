@@ -147,6 +147,8 @@ enum Modal {
     Palette,
     Rename { machine: String, session: String, input: Entity<InputState>, _sub: Subscription },
     Settings { view: Entity<SettingsView>, _sub: Subscription },
+    /// What one machine's Rex server says about itself; rows None while loading.
+    ServerInfo { machine: String, rows: Option<Vec<(String, String)>>, message: Option<String> },
     /// The search bar over one pane.
     Search { block: String, input: Entity<InputState>, _sub: Subscription },
 }
@@ -860,6 +862,13 @@ impl Workspace {
 
     fn run(&mut self, cmd: Command, window: &mut Window, cx: &mut Context<Self>) {
         match cmd {
+            Command::ServerInfo => {
+                let key = self.shown.clone().or_else(|| self.machines.first().map(|m| m.spec.key.clone()));
+                if let Some(k) = key {
+                    self.open_server_info(k, window, cx);
+                }
+                return;
+            }
             Command::Palette => return self.open_palette(window, cx),
             Command::Settings => return self.open_settings(window, cx),
             _ => {}
@@ -947,6 +956,7 @@ impl Workspace {
             }
             Command::Palette | Command::Settings => {}
             Command::Search => self.open_search(window, cx),
+            Command::ServerInfo => {}
             Command::ToggleSidebar => {
                 self.sidebar.update(cx, |s, cx| s.toggle(cx));
                 self.save_state(window, cx);
@@ -1192,6 +1202,56 @@ impl Workspace {
         )
     }
 
+    fn open_server_info(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
+        let connected = self.machine(&key).is_some_and(|m| m.control.is_some() && m.conn == ConnState::Connected);
+        let message = (!connected).then(|| t("This machine isn't connected.", "这台机器没有连接。").to_string());
+        self.modal = Modal::ServerInfo { machine: key.clone(), rows: if connected { None } else { Some(Vec::new()) }, message };
+        if connected {
+            self.load_server_info(key, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn load_server_info(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(control) = self.machine(&key).and_then(|m| m.control.clone()) else { return };
+        self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+            let rows = cx
+                .background_spawn(async move {
+                    let call = |m: &str| control.call(m, json!({})).unwrap_or(Value::Null);
+                    crate::server_info::info_rows(&call("server.version"), &call("server.status"), &call("client.list"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Modal::ServerInfo { machine, rows: slot, .. } = &mut this.modal
+                    && *machine == key
+                {
+                    *slot = Some(rows);
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn reload_config(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(control) = self.machine(&key).and_then(|m| m.control.clone()) else { return };
+        self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(async move { control.call("server.config_reload", json!({})) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let text = match result {
+                    Ok(v) => crate::server_info::reload_text(&v),
+                    Err(e) => format!("{}{e}", t("Can't reload the config: ", "无法重新加载配置:")),
+                };
+                if let Modal::ServerInfo { machine, message, .. } = &mut this.modal
+                    && *machine == key
+                {
+                    *message = Some(text);
+                    this.load_server_info(key, window, cx);
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pinned = self.machines.first().is_some_and(|m| m.spec.key == "cli");
         let settings = self.settings.clone();
@@ -1369,6 +1429,61 @@ impl Workspace {
                     .child(view.clone())
                     .into_any_element(),
             ),
+            Modal::ServerInfo { machine, rows, message } => {
+                let name = self.machine(machine).map(|m| m.spec.name.clone()).unwrap_or_default();
+                let mut body = div().flex().flex_col().gap_1().min_w(px(520.));
+                match rows {
+                    None => body = body.child(div().text_sm().text_color(rgb(0x9a9a9a)).child(t("Loading…", "正在读取…"))),
+                    Some(rows) => {
+                        for (label, value) in rows {
+                            body = body.child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .text_sm()
+                                    .child(div().w(px(100.)).text_color(rgb(0x9a9a9a)).child(label.clone()))
+                                    .child(div().flex_1().child(value.clone())),
+                            );
+                        }
+                    }
+                }
+                if let Some(m) = message {
+                    body = body.child(div().pt_2().text_sm().child(m.clone()));
+                }
+                let connected = self.machine(machine).is_some_and(|m| m.control.is_some());
+                let (k1, k2) = (machine.clone(), machine.clone());
+                let mut footer = div().flex().gap_2();
+                if connected {
+                    footer = footer
+                        .child(Button::new("info-refresh").label(t("Refresh", "刷新")).on_click(cx.listener(move |this, _, window, cx| this.load_server_info(k1.clone(), window, cx))))
+                        .child(Button::new("info-reload").label(t("Reload config", "重新加载配置")).on_click(cx.listener(move |this, _, window, cx| this.reload_config(k2.clone(), window, cx))));
+                }
+                footer = footer.child(Button::new("info-close").primary().label(t("Close", "关闭")).on_click(cx.listener(|this, _, window, cx| {
+                    this.modal = Modal::None;
+                    this.focus_terminal(window, cx);
+                    cx.notify();
+                })));
+                Some(
+                    Dialog::new("server-info")
+                        .open(true)
+                        .title(format!("{} — {name}", t("Rex server", "Rex 服务端")))
+                        .w(px(600.))
+                        .on_open_change(move |open, window, cx| {
+                            if !open {
+                                let _ = this.update(cx, |this, cx| {
+                                    if matches!(this.modal, Modal::ServerInfo { .. }) {
+                                        this.modal = Modal::None;
+                                        this.focus_terminal(window, cx);
+                                        cx.notify();
+                                    }
+                                });
+                            }
+                        })
+                        .footer(footer)
+                        .child(body)
+                        .into_any_element(),
+                )
+            }
             Modal::Rename { input, .. } => Some(
                 Dialog::new("rename-session")
                     .open(true)
@@ -1415,6 +1530,15 @@ impl Workspace {
                 Some(s) => format!("{}{via} · {s}", m.spec.name),
                 None => format!("{}{via}", m.spec.name),
             });
+            if m.conn == ConnState::Connected {
+                let k = key.clone();
+                group = group.action(
+                    Button::new(SharedString::from(format!("info-{key}")))
+                        .ghost()
+                        .label("ⓘ")
+                        .on_click(cx.listener(move |this, _, window, cx| this.open_server_info(k.clone(), window, cx))),
+                );
+            }
             if matches!(m.conn, ConnState::Failed(_)) {
                 let k = key.clone();
                 group = group.child(

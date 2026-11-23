@@ -12,6 +12,7 @@ mod keys;
 mod machines;
 mod palette;
 mod panes;
+mod server_info;
 mod settings_view;
 mod workspace;
 
