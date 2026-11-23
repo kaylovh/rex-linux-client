@@ -7,7 +7,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_cn::{Sidebar, SidebarGroup, SidebarLayout, SidebarMenuButton, SidebarState, Tab, Tabs, TabsEvent, TabsState};
+use gpui_cn::{
+    Button, CommandDialog, CommandEvent, CommandItem, CommandState, Dialog, Input, Sidebar, SidebarGroup, SidebarLayout, SidebarMenuButton,
+    SidebarState, Tab, Tabs, TabsEvent, TabsState,
+};
+use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::base::Selectable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -24,7 +28,7 @@ use crate::config::{self, Settings, WorkspaceState};
 use crate::i18n::t;
 use crate::keys::gui_command;
 use crate::machines::{ConnState, MachineSpec};
-use crate::palette::session_name;
+use crate::palette::{PaletteAction, PaletteEntry, PaletteSession, palette_entries, session_name};
 use crate::panes::{PaneEntry, PaneSet, PaneStatus, diff};
 
 const SHELL: &str = "com.superlogical.terminal.shell";
@@ -118,6 +122,13 @@ struct Machine {
     tasks: Vec<Task<()>>,
 }
 
+/// A dialog over the window.
+enum Modal {
+    None,
+    Palette,
+    Rename { machine: String, session: String, input: Entity<InputState>, _sub: Subscription },
+}
+
 /// Where to go once a machine connects. `machine` None: the first machine that connects.
 struct Start {
     machine: Option<String>,
@@ -152,6 +163,9 @@ pub struct Workspace {
     focus: FocusHandle,
     _subs: Vec<Subscription>,
     fetching_view: bool,
+    modal: Modal,
+    palette: Entity<CommandState>,
+    palette_entries: Vec<PaletteEntry>,
     tasks: Vec<Task<()>>,
 }
 
@@ -172,6 +186,13 @@ impl Workspace {
             }
         });
         let banner = (!init.notices.is_empty()).then(|| init.notices.join(" · "));
+        let palette = cx.new(|cx| CommandState::new(t("Type a command or a session…", "输入命令或 session…"), window, cx));
+        cx.subscribe_in(&palette, window, |this, _, ev: &CommandEvent, window, cx| {
+            if let CommandEvent::Confirmed(key) = ev {
+                this.palette_chosen(key.to_string(), window, cx);
+            }
+        })
+        .detach();
         let mut me = Self {
             machines: init
                 .specs
@@ -197,6 +218,9 @@ impl Workspace {
             focus,
             _subs: vec![key_sub],
             fetching_view: false,
+            modal: Modal::None,
+            palette,
+            palette_entries: Vec::new(),
             tasks: Vec::new(),
         };
         cx.subscribe_in(&tabs, window, Self::on_tab_event).detach();
@@ -770,6 +794,11 @@ impl Workspace {
     // ---- commands -------------------------------------------------------------------
 
     fn run(&mut self, cmd: Command, window: &mut Window, cx: &mut Context<Self>) {
+        match cmd {
+            Command::Palette => return self.open_palette(window, cx),
+            Command::Settings => return self.open_settings(window, cx),
+            _ => {}
+        }
         let Some(sid) = self.sid() else {
             if cmd == Command::NewSession {
                 let first = self.shown.clone().or_else(|| self.machines.iter().find(|m| m.conn == ConnState::Connected).map(|m| m.spec.key.clone()));
@@ -839,9 +868,19 @@ impl Workspace {
                 }
             }
             // Renaming sessions comes with the M2b palette/settings work.
-            Command::RenameSession => {}
-            // Wired with the dialogs.
-            Command::Palette | Command::Settings | Command::CloseSession => {}
+            Command::RenameSession => self.open_rename(window, cx),
+            Command::CloseSession => {
+                let label = self.session_label(&sid);
+                self.confirm(
+                    t("Close this session?", "关闭这个 session?"),
+                    &format!("{label} — {}", t("every tab and program in it will end.", "其中所有 tab 和程序都会结束。")),
+                    t("Close", "关闭"),
+                    move |this, _, _| this.send("session.destroy", json!({"session_id": sid})),
+                    window,
+                    cx,
+                );
+            }
+            Command::Palette | Command::Settings => {}
             Command::ToggleSidebar => {
                 self.sidebar.update(cx, |s, cx| s.toggle(cx));
                 self.save_state(window, cx);
@@ -893,6 +932,11 @@ impl Workspace {
     /// Ctrl-b and the key after it, and the GUI shortcuts, before key bindings and the
     /// terminal see them.
     fn on_keystroke(&mut self, ev: &KeystrokeEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A dialog takes every key: typing a name must not start commands.
+        if !matches!(self.modal, Modal::None) {
+            self.prefix = false;
+            return;
+        }
         let ks = &ev.keystroke;
         if self.prefix {
             self.prefix = false;
@@ -912,6 +956,147 @@ impl Workspace {
         if let Some(cmd) = gui_command(ks) {
             self.run(cmd, window, cx);
             cx.stop_propagation();
+        }
+    }
+
+    // ---- dialogs ----------------------------------------------------------------------
+
+    fn session_label(&self, sid: &str) -> String {
+        self.shown_machine()
+            .and_then(|m| m.model.sessions.iter().find(|s| s.id == sid))
+            .map(|s| session_name(&s.id, &s.label))
+            .unwrap_or_default()
+    }
+
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut sessions = Vec::new();
+        let mut connected = Vec::new();
+        for m in &self.machines {
+            if m.conn == ConnState::Connected {
+                connected.push((m.spec.key.as_str(), m.spec.name.as_str()));
+            }
+            let shown = self.shown.as_deref() == Some(m.spec.key.as_str());
+            for s in &m.model.sessions {
+                sessions.push(PaletteSession {
+                    machine_key: &m.spec.key,
+                    machine_name: &m.spec.name,
+                    id: &s.id,
+                    label: &s.label,
+                    current: shown && m.model.current.as_deref() == Some(s.id.as_str()),
+                });
+            }
+        }
+        let entries = palette_entries(&sessions, &connected, self.sid().is_some());
+        let items: Vec<CommandItem> = entries
+            .iter()
+            .map(|e| {
+                let (label, hint) = (SharedString::from(e.label.clone()), e.hint.clone());
+                CommandItem::new(e.key.clone(), e.label.clone()).render(move |_, _, _| {
+                    div()
+                        .flex()
+                        .w_full()
+                        .justify_between()
+                        .child(label.clone())
+                        .children(hint.clone().map(|h| div().text_color(rgb(0x8a8a8a)).child(h)))
+                })
+            })
+            .collect();
+        self.palette_entries = entries;
+        self.palette.update(cx, |p, cx| p.set_entries(items, cx));
+        self.modal = Modal::Palette;
+        let _ = window;
+        cx.notify();
+    }
+
+    fn palette_chosen(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(action) = self.palette_entries.iter().find(|e| e.key == key).map(|e| e.action.clone()) else { return };
+        self.modal = Modal::None;
+        // After the palette has closed and handed focus back.
+        self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| match action {
+                PaletteAction::Run(cmd) => this.run(cmd, window, cx),
+                PaletteAction::Open { machine, session } => this.open(machine, session, window, cx),
+                PaletteAction::NewSession(machine) => this.new_session(machine, window, cx),
+            });
+        }));
+        cx.notify();
+    }
+
+    fn open_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(machine), Some(session)) = (self.shown.clone(), self.sid()) else { return };
+        let current = self.shown_machine().and_then(|m| m.model.sessions.iter().find(|s| s.id == session)).map(|s| s.label.clone()).unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
+        let sub = cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { .. } = ev {
+                this.finish_rename(true, window, cx);
+            }
+        });
+        input.update(cx, |i, cx| i.focus(window, cx));
+        self.modal = Modal::Rename { machine, session, input, _sub: sub };
+        cx.notify();
+    }
+
+    fn finish_rename(&mut self, apply: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Modal::Rename { machine, session, input, .. } = std::mem::replace(&mut self.modal, Modal::None) else { return };
+        let label = input.read(cx).value().trim().to_string();
+        if apply
+            && !label.is_empty()
+            && let Some(c) = self.machine(&machine).and_then(|m| m.control.clone())
+        {
+            c.send("session.set_label", json!({"session_id": session, "label": label}));
+        }
+        self.focus_terminal(window, cx);
+        cx.notify();
+    }
+
+    fn open_settings(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    fn render_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let this = cx.weak_entity();
+        match &self.modal {
+            Modal::None => None,
+            Modal::Palette => Some(
+                CommandDialog::new("palette", &self.palette)
+                    .open(true)
+                    .empty(t("Nothing matches.", "没有匹配项。"))
+                    .on_open_change(move |open, window, cx| {
+                        if !open {
+                            let _ = this.update(cx, |this, cx| {
+                                if matches!(this.modal, Modal::Palette) {
+                                    this.modal = Modal::None;
+                                    this.focus_terminal(window, cx);
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
+                    .into_any_element(),
+            ),
+            Modal::Rename { input, .. } => Some(
+                Dialog::new("rename-session")
+                    .open(true)
+                    .title(t("Rename session", "重命名 session"))
+                    .track_focus(&input.read(cx).focus_handle(cx))
+                    .on_open_change(move |open, window, cx| {
+                        if !open {
+                            let _ = this.update(cx, |this, cx| this.finish_rename(false, window, cx));
+                        }
+                    })
+                    .footer(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(Button::new("rename-cancel").label(t("Cancel", "取消")).on_click(cx.listener(|this, _, window, cx| this.finish_rename(false, window, cx))))
+                            .child(
+                                Button::new("rename-ok")
+                                    .primary()
+                                    .label(t("Rename", "重命名"))
+                                    .on_click(cx.listener(|this, _, window, cx| this.finish_rename(true, window, cx))),
+                            ),
+                    )
+                    .child(Input::new(input))
+                    .into_any_element(),
+            ),
         }
     }
 
@@ -1121,5 +1306,6 @@ impl Render for Workspace {
             .track_focus(&self.focus)
             .child(SidebarLayout::new(&self.sidebar).sidebar(self.render_sidebar(cx)).child(main))
             .children(self.drag_overlay(cx))
+            .children(self.render_modal(cx))
     }
 }
