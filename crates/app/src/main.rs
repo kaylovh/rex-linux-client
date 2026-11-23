@@ -84,6 +84,10 @@ fn main() {
             ),
         );
     }
+    let (themes, theme_errors) = theme::load_all(dir.as_deref());
+    for e in &theme_errors {
+        notices.push(format!("{} {e}", t("A theme file can't be used:", "主题文件无法使用:")));
+    }
     let start = machines::start_target(&specs, &state, args.session.as_deref());
     let init = workspace::Init {
         specs,
@@ -102,6 +106,7 @@ fn main() {
         gpui_kit::init(cx);
         gpui_cn::init(cx);
         fonts::register(cx);
+        theme::apply(theme::find(&themes, init.as_ref().and_then(|i| i.settings.theme.as_deref())), cx);
         cx.bind_keys(default_key_bindings());
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
@@ -119,8 +124,6 @@ fn main() {
         };
         let init = init.take().expect("run once");
         gpui_kit::open_window(options, cx, |window, cx| {
-            // The app draws a dark UI; the component theme (code views) matches it.
-            gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, Some(window), cx);
             let ws = cx.new(|cx| workspace::Workspace::new(init, window, cx));
             let w2 = ws.clone();
             // Unsaved files are asked about first; the answer finishes the close.

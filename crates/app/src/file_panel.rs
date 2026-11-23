@@ -602,7 +602,7 @@ impl Render for FilePanel {
             .gap_1()
             .p_1()
             .text_sm()
-            .text_color(rgb(0xd6d6d6))
+            .text_color(rgb(crate::theme::ui().text))
             // Files from the desktop: uploaded into the folder shown (or the selected one).
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 if this.read_only.is_none()
@@ -613,7 +613,7 @@ impl Render for FilePanel {
             }))
             .child(header);
         if self.picker_open {
-            let mut list = div().flex().flex_col().border_1().border_color(rgb(0x3a3a3a)).rounded_md();
+            let mut list = div().flex().flex_col().border_1().border_color(rgb(crate::theme::ui().border)).rounded_md();
             for (key, name) in &self.machines {
                 let k = key.clone();
                 list = list.child(
@@ -622,7 +622,7 @@ impl Render for FilePanel {
                         .px_2()
                         .py_0p5()
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgb(0x2f2f2f)))
+                        .hover(|s| s.bg(rgb(crate::theme::ui().hover)))
                         .child(name.clone())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.picker_open = false;
@@ -646,7 +646,7 @@ impl Render for FilePanel {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_color(rgb(0x9a9a9a)).child(label))
+                    .child(div().text_color(rgb(crate::theme::ui().muted)).child(label))
                     .child(Input::new(input))
                     .child(
                         div()
@@ -660,17 +660,17 @@ impl Render for FilePanel {
             );
         }
         if let Some(m) = &self.message {
-            panel = panel.child(div().text_color(rgb(0xe0a060)).child(m.clone()));
+            panel = panel.child(div().text_color(rgb(crate::theme::ui().warning)).child(m.clone()));
         }
         if let Some(why) = &self.read_only {
             let _ = why;
-            panel = panel.child(div().text_color(rgb(0x9a9a9a)).child(t("Read-only: reached through Rex.", "只读:经 Rex 访问。")));
+            panel = panel.child(div().text_color(rgb(crate::theme::ui().muted)).child(t("Read-only: reached through Rex.", "只读:经 Rex 访问。")));
         }
         if let Some(u) = &self.unavailable {
-            return panel.child(div().text_color(rgb(0x9a9a9a)).child(u.clone()));
+            return panel.child(div().text_color(rgb(crate::theme::ui().muted)).child(u.clone()));
         }
         if self.root.as_ref().is_some_and(|r| self.capped.contains(r)) {
-            panel = panel.child(div().text_color(rgb(0x9a9a9a)).child(format!("{} {ROW_CAP}", t("Showing the first", "只显示前"))));
+            panel = panel.child(div().text_color(rgb(crate::theme::ui().muted)).child(format!("{} {ROW_CAP}", t("Showing the first", "只显示前"))));
         }
         let count = rows.len();
         panel.child(
@@ -697,9 +697,9 @@ impl Render for FilePanel {
                                 .flex()
                                 .items_center()
                                 .cursor_pointer()
-                                .when(sel, |d| d.bg(rgb(0x2d4a7a)))
-                                .hover(|s| s.bg(rgb(0x2f2f2f)))
-                                .child(div().text_color(rgb(0x8a8a8a)).child(icon))
+                                .when(sel, |d| d.bg(rgb(crate::theme::ui().selected)))
+                                .hover(|s| s.bg(rgb(crate::theme::ui().hover)))
+                                .child(div().text_color(rgb(crate::theme::ui().muted)).child(icon))
                                 .child(div().overflow_hidden().text_ellipsis().whitespace_nowrap().child(row.name.clone()))
                                 .on_click(cx.listener(move |this, _, _, cx| this.click(&r2, cx)))
                         })
@@ -709,7 +709,7 @@ impl Render for FilePanel {
             .flex_1()
             .min_h_0(),
         )
-        .when(selected.is_none() && count == 0 && self.root.is_some(), |d| d.child(div().text_color(rgb(0x8a8a8a)).child(t("Empty folder", "空文件夹"))))
+        .when(selected.is_none() && count == 0 && self.root.is_some(), |d| d.child(div().text_color(rgb(crate::theme::ui().muted)).child(t("Empty folder", "空文件夹"))))
     }
 }
 

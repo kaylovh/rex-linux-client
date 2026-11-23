@@ -659,7 +659,7 @@ pub fn human_size(n: u64) -> String {
 
 impl Render for PreviewPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut strip = div().flex().flex_none().h(px(30.)).overflow_hidden().border_b_1().border_color(rgb(0x2a2a2a));
+        let mut strip = div().flex().flex_none().h(px(30.)).overflow_hidden().border_b_1().border_color(rgb(crate::theme::ui().border));
         for (i, tab) in self.tabs.iter().enumerate() {
             let active = i == self.active;
             strip = strip.child(
@@ -671,7 +671,7 @@ impl Render for PreviewPanel {
                     .px_2()
                     .text_sm()
                     .cursor_pointer()
-                    .when(active, |d| d.bg(rgb(0x2a2a2a)))
+                    .when(active, |d| d.bg(rgb(crate::theme::ui().border)))
                     .child(if matches!(&tab.content, Content::Text(t) if t.dirty) { format!("● {}", tab.name) } else { tab.name.clone() })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.active = i;
@@ -681,8 +681,8 @@ impl Render for PreviewPanel {
                         div()
                             .id(SharedString::from(format!("pv-close-{i}")))
                             .px_1()
-                            .text_color(rgb(0x8a8a8a))
-                            .hover(|s| s.text_color(rgb(0xe0e0e0)))
+                            .text_color(rgb(crate::theme::ui().muted))
+                            .hover(|s| s.text_color(rgb(crate::theme::ui().text)))
                             .child("×")
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
@@ -693,8 +693,8 @@ impl Render for PreviewPanel {
         }
         let body: AnyElement = match self.tabs.get(self.active).map(|t| &t.content) {
             None => div().into_any_element(),
-            Some(Content::Loading) => div().p_3().text_color(rgb(0x9a9a9a)).child(t("Loading…", "正在读取…")).into_any_element(),
-            Some(Content::Info(text)) => div().p_3().text_color(rgb(0xb0b0b0)).child(text.clone()).into_any_element(),
+            Some(Content::Loading) => div().p_3().text_color(rgb(crate::theme::ui().muted)).child(t("Loading…", "正在读取…")).into_any_element(),
+            Some(Content::Info(text)) => div().p_3().text_color(rgb(crate::theme::ui().muted)).child(text.clone()).into_any_element(),
             Some(Content::Image(image)) => div()
                 .size_full()
                 .p_2()
@@ -709,7 +709,7 @@ impl Render for PreviewPanel {
                 let main = if cfg!(target_os = "macos") { "Cmd-S" } else { "Ctrl-S" };
                 let mut bar = div().flex().flex_wrap().items_center().gap_2().px_2().py_0p5().text_sm();
                 if let Some(n) = &tt.note {
-                    bar = bar.child(div().text_color(rgb(0xe0a060)).child(n.clone()));
+                    bar = bar.child(div().text_color(rgb(crate::theme::ui().warning)).child(n.clone()));
                 }
                 if tt.editing {
                     let label = if tt.saving { t("Saving…", "正在保存…") } else { t("Save", "保存") };
@@ -722,16 +722,16 @@ impl Render for PreviewPanel {
                                 .disabled(tt.saving || !(tt.dirty || new_file))
                                 .on_click(cx.listener(move |this, _, window, cx| this.save(i, false, window, cx))),
                         )
-                        .child(div().text_color(rgb(0x8a8a8a)).child(main));
+                        .child(div().text_color(rgb(crate::theme::ui().muted)).child(main));
                 } else if let Some(why) = &tt.block {
-                    bar = bar.child(div().text_color(rgb(0x8a8a8a)).child(why.clone()));
+                    bar = bar.child(div().text_color(rgb(crate::theme::ui().muted)).child(why.clone()));
                 } else {
                     bar = bar.child(
                         Button::new("pv-edit").size(ButtonSize::Xs).label(t("Edit", "编辑")).on_click(cx.listener(move |this, _, window, cx| this.edit(i, window, cx))),
                     );
                 }
                 if let Some(m) = &tt.message {
-                    bar = bar.child(div().text_color(rgb(0xe0a060)).child(m.clone()));
+                    bar = bar.child(div().text_color(rgb(crate::theme::ui().warning)).child(m.clone()));
                 }
                 div()
                     .size_full()
@@ -747,9 +747,9 @@ impl Render for PreviewPanel {
             .size_full()
             .flex()
             .flex_col()
-            .text_color(rgb(0xd6d6d6))
+            .text_color(rgb(crate::theme::ui().text))
             .child(strip)
-            .child(div().px_2().py_0p5().text_xs().text_color(rgb(0x8a8a8a)).overflow_hidden().whitespace_nowrap().child(path))
+            .child(div().px_2().py_0p5().text_xs().text_color(rgb(crate::theme::ui().muted)).overflow_hidden().whitespace_nowrap().child(path))
             .child(div().flex_1().min_h_0().child(body))
     }
 }

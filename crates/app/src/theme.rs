@@ -137,6 +137,104 @@ impl ThemeFile {
     }
 }
 
+/// A Ghostty theme text for the terminal engine (its only public way in).
+fn ghostty_text(t: &TermColors) -> String {
+    let mut s = format!(
+        "background = #{:06x}\nforeground = #{:06x}\ncursor-color = #{:06x}\nselection-background = #{:06x}\nselection-foreground = #{:06x}\n",
+        t.background, t.foreground, t.cursor, t.selection, t.foreground
+    );
+    for (i, c) in t.palette.iter().enumerate() {
+        s.push_str(&format!("palette = {i}=#{c:06x}\n"));
+    }
+    s
+}
+
+pub fn terminal_colors(t: &AppTheme) -> gpui_cn::terminal::TerminalColors {
+    gpui_cn::terminal::TerminalColors::from_ghostty_theme(&ghostty_text(&t.terminal)).unwrap_or_default()
+}
+
+/// The theme in use, for code that draws (read without a context: one window, one thread).
+static CURRENT: std::sync::RwLock<Option<AppTheme>> = std::sync::RwLock::new(None);
+
+/// The theme in use.
+pub fn current() -> AppTheme {
+    CURRENT.read().ok().and_then(|c| c.clone()).unwrap_or_else(|| find(&builtin(), None).clone())
+}
+
+/// The interface colors in use.
+pub fn ui() -> UiColors {
+    CURRENT.read().ok().and_then(|c| c.as_ref().map(|t| t.ui)).unwrap_or_else(|| find(&builtin(), None).ui)
+}
+
+fn hsla(c: Rgb) -> gpui_kit::Hsla {
+    gpui_kit::rgb(c).into()
+}
+
+fn hex(c: Rgb) -> String {
+    format!("#{c:06x}")
+}
+
+/// Makes `t` the theme of every part of the window: gpui-cn's components (sidebar, tabs,
+/// dialogs), gpui-component's (editor, inputs) and the app's own drawing. Terminals take
+/// [`terminal_colors`] from their owner.
+pub fn apply(t: &AppTheme, cx: &mut gpui_kit::App) {
+    if let Ok(mut c) = CURRENT.write() {
+        *c = Some(t.clone());
+    }
+    let ui = t.ui;
+    let dark = t.dark;
+    gpui_cn::Theme::update(cx, |th| {
+        let mut cfg = if dark { gpui_cn::ThemeConfig::dark() } else { gpui_cn::ThemeConfig::light() };
+        cfg.surface = hsla(ui.background);
+        cfg.ink = hsla(ui.text);
+        cfg.accent = hsla(ui.accent);
+        cfg.semantic.success = hsla(ui.success);
+        cfg.semantic.destructive = hsla(ui.error);
+        cfg.semantic.warning = hsla(ui.warning);
+        if dark {
+            th.dark = cfg;
+            th.mode = gpui_cn::ThemeMode::Dark;
+        } else {
+            th.light = cfg;
+            th.mode = gpui_cn::ThemeMode::Light;
+        }
+    });
+    use gpui_kit::component::{Theme, ThemeMode};
+    Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
+    let config = serde_json::json!({
+        "name": t.name,
+        "mode": if dark { "dark" } else { "light" },
+        "colors": {
+            "background": hex(ui.background),
+            "foreground": hex(ui.text),
+            "border": hex(ui.border),
+            "input.border": hex(ui.border),
+            "muted.background": hex(ui.panel),
+            "muted.foreground": hex(ui.muted),
+            "accent.background": hex(ui.hover),
+            "accent.foreground": hex(ui.text),
+            "primary.background": hex(ui.accent),
+            "popover.background": hex(ui.elevated),
+            "popover.foreground": hex(ui.text),
+            "selection.background": hex(ui.selected),
+            "list.active.background": hex(ui.selected),
+            "list.hover.background": hex(ui.hover),
+            "sidebar.background": hex(ui.panel),
+            "sidebar.foreground": hex(ui.text),
+            "tab_bar.background": hex(ui.panel),
+            "title_bar.background": hex(ui.panel),
+            "danger.background": hex(ui.error),
+            "warning.background": hex(ui.warning),
+            "success.background": hex(ui.success),
+            "caret": hex(ui.accent),
+        }
+    });
+    if let Ok(cfg) = serde_json::from_value::<gpui_kit::component::ThemeConfig>(config) {
+        Theme::global_mut(cx).apply_config(&std::rc::Rc::new(cfg));
+    }
+    cx.refresh_windows();
+}
+
 /// The themes that ship with the app.
 pub fn builtin() -> Vec<AppTheme> {
     let files: Vec<ThemeFile> = serde_json::from_str(include_str!("../assets/themes.json")).expect("built-in themes");
@@ -164,6 +262,50 @@ pub fn load_dir(dir: &Path, builtin: &[AppTheme]) -> (Vec<AppTheme>, Vec<String>
         }
     }
     (themes, errors)
+}
+
+/// Puts an example theme in `dir` the first time, to copy from.
+pub fn write_example(dir: &Path) {
+    let p = dir.join("example.json.txt");
+    if !p.exists() {
+        let _ = std::fs::write(
+            p,
+            r##"{
+  "name": "My Theme",
+  "base": "One Dark",
+  "dark": true,
+  "ui": {
+    "background": "#1f2329", "panel": "#1a1d22", "elevated": "#262a31", "hover": "#2c313a",
+    "selected": "#3e4451", "border": "#14161a", "text": "#c8ccd4", "muted": "#7f848e",
+    "accent": "#e5a050", "warning": "#e5c07b", "error": "#e06c75", "success": "#98c379"
+  },
+  "terminal": {
+    "background": "#1f2329", "foreground": "#c8ccd4", "cursor": "#e5a050", "selection": "#3e4451",
+    "palette": ["#1f2329", "#e06c75", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#abb2bf",
+                "#5c6370", "#e06c75", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#ffffff"]
+  }
+}
+Copy this to a .json file in this folder, change what you like (leave out what you don't:
+it comes from "base"), then pick it in Settings.
+复制成本目录下的 .json 文件,修改需要的颜色(省略的项取自 "base"),然后在设置里选择。
+"##,
+        );
+    }
+}
+
+/// Every theme: the built-ins, then the user's in `<config>/themes`; and what couldn't be read.
+pub fn load_all(config: Option<&Path>) -> (Vec<AppTheme>, Vec<String>) {
+    let mut all = builtin();
+    let (mine, errors) = match config {
+        Some(c) => load_dir(&c.join("themes"), &all),
+        None => (vec![], vec![]),
+    };
+    for t in mine {
+        // A user theme with a built-in's name replaces it.
+        all.retain(|b| b.name != t.name);
+        all.push(t);
+    }
+    (all, errors)
 }
 
 /// The theme named `name`, else the default.
@@ -237,6 +379,30 @@ mod tests {
         assert!(errors.iter().any(|e| e.contains("color.json") && e.contains("blue")));
         // A missing folder is no error.
         assert_eq!(load_dir(&d.join("nope"), &builtin()), (vec![], vec![]));
+    }
+
+    #[test]
+    fn terminal_colors_follow_the_theme() {
+        let b = builtin();
+        for t in &b {
+            let c = terminal_colors(t);
+            let bg = c.background();
+            assert_eq!((bg.0 as u32) << 16 | (bg.1 as u32) << 8 | bg.2 as u32, t.terminal.background, "{}", t.name);
+        }
+    }
+
+    /// Every color in the app comes from the theme.
+    #[test]
+    fn no_hard_coded_colors() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for e in std::fs::read_dir(src).unwrap().flatten() {
+            let p = e.path();
+            if p.file_name().is_some_and(|n| n == "theme.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).unwrap();
+            assert!(!text.contains("rgb(0x"), "{} has a hard-coded color", p.display());
+        }
     }
 
     #[test]

@@ -25,7 +25,7 @@ pub fn terminal_config(font: &FontSettings) -> TerminalConfig {
     if !font.fallbacks.is_empty() {
         a = a.with_font_fallbacks(font.fallbacks.clone());
     }
-    TerminalConfig::default().with_appearance(a)
+    TerminalConfig::default().with_appearance(a).with_colors(crate::theme::terminal_colors(&crate::theme::current()))
 }
 
 /// The font fields as typed: empty means "the theme's"; the fallbacks are comma-separated.
@@ -73,6 +73,7 @@ pub struct SettingsView {
     downloads: Entity<InputState>,
     theme: Option<String>,
     icon: Option<String>,
+    config_dir: Option<std::path::PathBuf>,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -105,7 +106,43 @@ impl SettingsView {
             downloads: input(settings.download_dir.clone().unwrap_or_default(), "~/Downloads", window, cx),
             theme: settings.theme.clone(),
             icon: settings.icon.clone(),
+            config_dir: crate::config::config_dir(|k| std::env::var(k).ok()),
         }
+    }
+
+    fn render_themes(&self, cx: &mut Context<Self>) -> Div {
+        let (all, errors) = crate::theme::load_all(self.config_dir.as_deref());
+        let current = crate::theme::find(&all, self.theme.as_deref()).name.clone();
+        let mut row = div().flex().flex_wrap().gap_1();
+        for th in &all {
+            let name = th.name.clone();
+            let swatch = div().size(px(10.)).rounded_full().bg(gpui_kit::rgb(th.ui.accent)).border_1().border_color(gpui_kit::rgb(th.ui.background));
+            let b = Button::new(SharedString::from(format!("theme-{name}")))
+                .size(gpui_cn::ButtonSize::Xs)
+                .child(div().flex().items_center().gap_1().child(swatch).child(name.clone()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.theme = Some(name.clone());
+                    cx.notify();
+                }));
+            row = row.child(if th.name == current { b.primary() } else { b.outline() });
+        }
+        let dir = self.config_dir.as_ref().map(|d| d.join("themes"));
+        let mut col = div().flex().flex_col().gap_1().child(row);
+        if let Some(dir) = dir {
+            col = col.child(
+                div().flex().items_center().gap_2().text_xs().text_color(gpui_kit::rgb(crate::theme::ui().muted))
+                    .child(format!("{} {}", t("Your own themes: JSON files in", "自定义主题:放在此目录的 JSON 文件"), dir.display()))
+                    .child(Button::new("themes-open").ghost().size(gpui_cn::ButtonSize::Xs).label(t("Open folder", "打开目录")).on_click(move |_, _, cx| {
+                        let _ = std::fs::create_dir_all(&dir);
+                        crate::theme::write_example(&dir);
+                        cx.open_url(&format!("file://{}", dir.display()));
+                    })),
+            );
+        }
+        for e in errors {
+            col = col.child(div().text_xs().text_color(gpui_kit::rgb(crate::theme::ui().error)).child(e));
+        }
+        col
     }
 
     fn download_value(&self, cx: &App) -> Option<String> {
@@ -158,7 +195,7 @@ impl SettingsView {
     }
 
     fn section(title: &'static str) -> Div {
-        div().pt_2().text_sm().text_color(rgb(0x9a9a9a)).child(title)
+        div().pt_2().text_sm().text_color(rgb(crate::theme::ui().muted)).child(title)
     }
 }
 
@@ -176,7 +213,7 @@ impl Render for SettingsView {
         };
         let mut machines = div().flex().flex_col().gap_1();
         machines = machines.child(
-            div().flex().gap_2().text_sm().child(div().w(px(110.)).child(t("This computer", "本机"))).child(div().text_color(rgb(0x9a9a9a)).child(t("always shown", "始终显示"))),
+            div().flex().gap_2().text_sm().child(div().w(px(110.)).child(t("This computer", "本机"))).child(div().text_color(rgb(crate::theme::ui().muted)).child(t("always shown", "始终显示"))),
         );
         for (i, m) in self.machines.iter().enumerate() {
             let row = div()
@@ -185,7 +222,7 @@ impl Render for SettingsView {
                 .gap_2()
                 .text_sm()
                 .child(div().w(px(110.)).child(m.name.clone()))
-                .child(div().flex_1().text_color(rgb(0x9a9a9a)).child(m.endpoint.clone()));
+                .child(div().flex_1().text_color(rgb(crate::theme::ui().muted)).child(m.endpoint.clone()));
             machines = machines.child(if self.pinned {
                 row
             } else {
@@ -200,7 +237,7 @@ impl Render for SettingsView {
             });
         }
         if self.pinned {
-            machines = machines.child(div().text_sm().text_color(rgb(0x9a9a9a)).child(t(
+            machines = machines.child(div().text_sm().text_color(rgb(crate::theme::ui().muted)).child(t(
                 "Started with -S: only that machine is shown, and the list can't be changed here.",
                 "用 -S 启动时只显示那一台机器,这里不能修改列表。",
             )));
@@ -245,13 +282,15 @@ impl Render for SettingsView {
                 }
                 row
             }))
+            .child(Self::section(t("Theme", "主题")))
+            .child(self.render_themes(cx))
             .child(Self::section(t("Downloads", "下载")))
             .child(field(t("Folder", "目录"), &self.downloads))
             .child(Self::section(t("Terminal font", "终端字体")))
             .child(field(t("Family", "字体"), &self.family))
             .child(field(t("Size", "字号"), &self.size))
             .child(field(t("Fallbacks", "备用字体"), &self.fallbacks))
-            .children(self.error.clone().map(|e| div().text_sm().text_color(rgb(0xe06c6c)).child(e)))
+            .children(self.error.clone().map(|e| div().text_sm().text_color(rgb(crate::theme::ui().error)).child(e)))
             .child(
                 div()
                     .flex()

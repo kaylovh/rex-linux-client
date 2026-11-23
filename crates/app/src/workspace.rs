@@ -1395,7 +1395,7 @@ impl Workspace {
                         .w_full()
                         .justify_between()
                         .child(label.clone())
-                        .children(hint.clone().map(|h| div().text_color(rgb(0x8a8a8a)).child(h)))
+                        .children(hint.clone().map(|h| div().text_color(rgb(crate::theme::ui().muted)).child(h)))
                 })
             })
             .collect();
@@ -1515,13 +1515,13 @@ impl Workspace {
                 .items_center()
                 .gap_1()
                 .p_1()
-                .bg(rgb(0x2b2b2b))
+                .bg(rgb(crate::theme::ui().elevated))
                 .border_1()
-                .border_color(rgb(0x4a4a4a))
+                .border_color(rgb(crate::theme::ui().border))
                 .rounded_md()
                 .occlude()
                 .child(div().flex_1().child(Input::new(input)))
-                .child(div().w(px(80.)).text_sm().text_color(rgb(0xb0b0b0)).child(count))
+                .child(div().w(px(80.)).text_sm().text_color(rgb(crate::theme::ui().muted)).child(count))
                 .child(step("search-older", "↑", true, cx))
                 .child(step("search-newer", "↓", false, cx))
                 .child(Button::new("search-close").ghost().label("✕").on_click(cx.listener(|this, _, window, cx| this.close_search(window, cx)))),
@@ -2140,7 +2140,7 @@ impl Workspace {
                     (XferState::Done, _) => gpui_cn::Progress::new(SharedString::from(format!("xfer-{id}"))).value(100.0).into_any_element(),
                     _ => div().into_any_element(),
                 }))
-                .child(div().w(px(220.)).overflow_hidden().whitespace_nowrap().text_ellipsis().text_color(rgb(0xa0a0a0)).child(status));
+                .child(div().w(px(220.)).overflow_hidden().whitespace_nowrap().text_ellipsis().text_color(rgb(crate::theme::ui().muted)).child(status));
             row = match t.state {
                 XferState::Queued | XferState::Running => row.child(
                     Button::new(SharedString::from(format!("xfer-cancel-{id}"))).ghost().size(ButtonSize::Xs).icon(IconName::X).tooltip(t_("Cancel", "取消")).on_click(cx.listener(move |this, _, _, cx| this.cancel_transfer(id, cx))),
@@ -2162,7 +2162,7 @@ impl Workspace {
             .gap_2()
             .px_2()
             .text_xs()
-            .text_color(rgb(0xa0a0a0))
+            .text_color(rgb(crate::theme::ui().muted))
             .child(format!("{} · {} {}", t("Transfers", "传输"), self.transfers.active(), t("active", "进行中")))
             .child(div().flex_1())
             .child(Button::new("xfer-clear").ghost().size(ButtonSize::Xs).label(t("Clear finished", "清除已完成")).on_click(cx.listener(|this, _, _, cx| {
@@ -2175,7 +2175,7 @@ impl Workspace {
                 this.transfers_open = false;
                 cx.notify();
             })));
-        Some(div().flex_none().max_h(px(180.)).py_1().border_t_1().border_color(rgb(0x2a2a2a)).bg(rgb(0x1b1b1b)).flex().flex_col().gap_1().child(header).child(list))
+        Some(div().flex_none().max_h(px(180.)).py_1().border_t_1().border_color(rgb(crate::theme::ui().border)).bg(rgb(crate::theme::ui().panel)).flex().flex_col().gap_1().child(header).child(list))
     }
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2224,7 +2224,19 @@ impl Workspace {
         self.notices.clear();
         crate::i18n::set_language(s.language);
         let font_changed = s.font != self.settings.font;
+        let theme_changed = s.theme != self.settings.theme;
         self.settings = s;
+        if theme_changed {
+            let (all, _) = crate::theme::load_all(self.config.as_deref());
+            let th = crate::theme::find(&all, self.settings.theme.as_deref()).clone();
+            crate::theme::apply(&th, cx);
+            let colors = crate::theme::terminal_colors(&th);
+            for b in self.panes.blocks() {
+                if let Some(term) = self.panes.terminal(&b) {
+                    term.update(cx, |t, cx| t.set_colors(colors.clone(), cx));
+                }
+            }
+        }
         if font_changed {
             let appearance = terminal_config(&self.settings.font).appearance().clone();
             for b in self.panes.blocks() {
@@ -2349,7 +2361,7 @@ impl Workspace {
                 let name = self.machine(machine).map(|m| m.spec.name.clone()).unwrap_or_default();
                 let mut body = div().flex().flex_col().gap_1().min_w(px(520.));
                 match rows {
-                    None => body = body.child(div().text_sm().text_color(rgb(0x9a9a9a)).child(t("Loading…", "正在读取…"))),
+                    None => body = body.child(div().text_sm().text_color(rgb(crate::theme::ui().muted)).child(t("Loading…", "正在读取…"))),
                     Some(rows) => {
                         for (label, value) in rows {
                             body = body.child(
@@ -2357,7 +2369,7 @@ impl Workspace {
                                     .flex()
                                     .gap_2()
                                     .text_sm()
-                                    .child(div().w(px(100.)).text_color(rgb(0x9a9a9a)).child(label.clone()))
+                                    .child(div().w(px(100.)).text_color(rgb(crate::theme::ui().muted)).child(label.clone()))
                                     .child(div().flex_1().child(value.clone())),
                             );
                         }
@@ -2404,7 +2416,7 @@ impl Workspace {
                 let upload = req.direction == XferDirection::Upload;
                 let names: Vec<String> = req.sources.iter().map(|s| s.trim_end_matches('/').rsplit('/').next().unwrap_or(s).to_string()).collect();
                 let mut body = div().flex().flex_col().gap_2().min_w(px(520.)).text_sm();
-                body = body.child(div().text_color(rgb(0xb0b0b0)).child(format!(
+                body = body.child(div().text_color(rgb(crate::theme::ui().muted)).child(format!(
                     "{} {}: {}",
                     names.len(),
                     t("item(s)", "项"),
@@ -2617,8 +2629,8 @@ impl Workspace {
             .h(relative(r.h))
             .p(px(1.))
             .border_1()
-            .border_color(if focused { rgb(0x5a8dee) } else { rgb(0x2a2a2a) })
-            .when(p.floating, |d| d.bg(rgb(0x1e1e1e)).occlude())
+            .border_color(if focused { rgb(crate::theme::ui().accent) } else { rgb(crate::theme::ui().border) })
+            .when(p.floating, |d| d.bg(rgb(crate::theme::ui().elevated)).occlude())
             // Capture phase: a program that takes the mouse stops the click in the terminal.
             .capture_any_mouse_down(cx.listener(move |this, _, _, _| {
                 if this.focused_block.as_deref() != Some(bid.as_str())
@@ -2634,7 +2646,7 @@ impl Workspace {
                     c = c.child(bar);
                 }
                 if let Some(text) = self.panes.status(&p.block_id).text() {
-                    c = c.child(div().absolute().bottom_0().left_0().right_0().px_2().bg(rgb(0x3a3a3a)).text_sm().text_color(rgb(0xe0e0e0)).child(text));
+                    c = c.child(div().absolute().bottom_0().left_0().right_0().px_2().bg(rgb(crate::theme::ui().elevated)).text_sm().text_color(rgb(crate::theme::ui().text)).child(text));
                 }
                 c
             }
@@ -2644,7 +2656,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_color(rgb(0x909090))
+                    .text_color(rgb(crate::theme::ui().muted))
                     .child(self.panes.status(&p.block_id).text().unwrap_or_default()),
             ),
             (false, _) => cell.child(
@@ -2653,7 +2665,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_color(rgb(0x909090))
+                    .text_color(rgb(crate::theme::ui().muted))
                     .child(format!("{} {}", p.label, t("(not a terminal)", "(不是终端)"))),
             ),
         }
@@ -2691,7 +2703,7 @@ impl Workspace {
                     .cursor(CursorStyle::ResizeUpDown),
             };
             let key = (s.before_block.clone(), s.after_block.clone(), s.direction, s.ratio);
-            let hit = hit.when(dragging.is_some(), |d| d.bg(rgb(0x5a8dee))).on_mouse_down(
+            let hit = hit.when(dragging.is_some(), |d| d.bg(rgb(crate::theme::ui().accent))).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
                     this.drag = Some(key.clone());
@@ -2761,7 +2773,7 @@ impl Render for Workspace {
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x1e1e1e))
+            .bg(rgb(crate::theme::ui().panel))
             .child(
                 div()
                     .flex_none()
@@ -2779,8 +2791,8 @@ impl Render for Workspace {
                         .id("status-line")
                         .px_3()
                         .py_1()
-                        .bg(rgb(0x3a3a3a))
-                        .text_color(rgb(0xe0e0e0))
+                        .bg(rgb(crate::theme::ui().elevated))
+                        .text_color(rgb(crate::theme::ui().text))
                         .text_sm()
                         .child(s)
                         // A click puts the standing notices away.
@@ -2803,8 +2815,8 @@ impl Render for Workspace {
                                 .flex_none()
                                 .h_full()
                                 .border_l_1()
-                                .border_color(rgb(0x2a2a2a))
-                                .bg(rgb(0x1e1e1e))
+                                .border_color(rgb(crate::theme::ui().border))
+                                .bg(rgb(crate::theme::ui().panel))
                                 .child(self.preview.clone()),
                         )
                     })
@@ -2815,8 +2827,8 @@ impl Render for Workspace {
                                 .flex_none()
                                 .h_full()
                                 .border_l_1()
-                                .border_color(rgb(0x2a2a2a))
-                                .bg(rgb(0x1b1b1b))
+                                .border_color(rgb(crate::theme::ui().border))
+                                .bg(rgb(crate::theme::ui().panel))
                                 .child(self.files.clone()),
                         )
                     }),
