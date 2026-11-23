@@ -10,6 +10,7 @@ mod keys;
 mod machines;
 mod palette;
 mod panes;
+mod settings_view;
 mod workspace;
 
 use gpui_kit::*;

@@ -21,7 +21,7 @@ use rex_client::prefix::{Command, Dir, prefix_command};
 use rex_proto::control::Control;
 use rexterm::rex::{BlockRef, RexEvent, RexSource, attach, is_transient, keys::to_rex_key, recover};
 use rexterm::terminal::input::{KeyInput, Modifiers};
-use rexterm::terminal::{Terminal, TerminalConfig, TerminalState};
+use rexterm::terminal::{Terminal, TerminalState};
 use serde_json::{Value, json};
 
 use crate::config::{self, Settings, WorkspaceState};
@@ -29,7 +29,9 @@ use crate::i18n::t;
 use crate::keys::gui_command;
 use crate::machines::{ConnState, MachineSpec};
 use crate::palette::{PaletteAction, PaletteEntry, PaletteSession, palette_entries, session_name};
+use crate::machines::machine_specs;
 use crate::panes::{PaneEntry, PaneSet, PaneStatus, diff};
+use crate::settings_view::{SettingsEvent, SettingsView, terminal_config};
 
 const SHELL: &str = "com.superlogical.terminal.shell";
 
@@ -127,6 +129,7 @@ enum Modal {
     None,
     Palette,
     Rename { machine: String, session: String, input: Entity<InputState>, _sub: Subscription },
+    Settings { view: Entity<SettingsView>, _sub: Subscription },
 }
 
 /// Where to go once a machine connects. `machine` None: the first machine that connects.
@@ -141,9 +144,7 @@ pub struct Workspace {
     /// The machine whose session is shown.
     shown: Option<String>,
     start: Option<Start>,
-    #[allow(dead_code)]
     settings: Settings,
-    #[allow(dead_code)]
     settings_broken: bool,
     config: Option<PathBuf>,
     save_enabled: bool,
@@ -684,7 +685,7 @@ impl Workspace {
         }
         let (source, events) = RexSource::new(block.clone(), attached);
         let engine = source.engine();
-        let terminal = cx.new(|cx| TerminalState::new(engine, TerminalConfig::default(), window, cx));
+        let terminal = cx.new(|cx| TerminalState::new(engine, terminal_config(&self.settings.font), window, cx));
         cx.observe(&terminal, |_, _, cx| cx.notify()).detach();
         let id = block.block_id.clone();
         entry.terminal = Some(terminal);
@@ -1049,7 +1050,103 @@ impl Workspace {
         cx.notify();
     }
 
-    fn open_settings(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pinned = self.machines.first().is_some_and(|m| m.spec.key == "cli");
+        let settings = self.settings.clone();
+        let view = cx.new(|cx| SettingsView::new(&settings, pinned, window, cx));
+        let sub = cx.subscribe_in(&view, window, |this, view, ev: &SettingsEvent, window, cx| match ev {
+            SettingsEvent::Cancel => this.close_settings(window, cx),
+            SettingsEvent::Save(s) => {
+                if let Err(e) = this.apply_settings(s.clone(), window, cx) {
+                    view.update(cx, |v, cx| v.set_error(e, cx));
+                } else {
+                    this.close_settings(window, cx);
+                }
+            }
+        });
+        self.modal = Modal::Settings { view, _sub: sub };
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.modal, Modal::Settings { .. }) {
+            self.modal = Modal::None;
+            self.focus_terminal(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Saves the settings and applies them now: language, terminal font, machines.
+    fn apply_settings(&mut self, s: Settings, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
+        if let Some(dir) = &self.config {
+            config::save_settings(dir, &s, self.settings_broken).map_err(|e| format!("{}{e}", t("Can't save the settings: ", "无法保存设置:")))?;
+        }
+        self.settings_broken = false;
+        crate::i18n::set_language(s.language);
+        let font_changed = s.font != self.settings.font;
+        self.settings = s;
+        if font_changed {
+            let appearance = terminal_config(&self.settings.font).appearance().clone();
+            for b in self.panes.blocks() {
+                if let Some(term) = self.panes.terminal(&b) {
+                    term.update(cx, |t, cx| t.set_appearance(appearance.clone(), cx));
+                }
+            }
+        }
+        let pinned = self.machines.first().is_some_and(|m| m.spec.key == "cli");
+        if !pinned && let Some(local) = self.machines.iter().find(|m| m.spec.local).map(|m| m.spec.endpoint.clone()) {
+            let (specs, _) = machine_specs(None, &self.settings, local);
+            self.set_machines(specs, window, cx);
+        }
+        cx.refresh_windows();
+        Ok(())
+    }
+
+    /// Follows a new machine list: connects the new ones, drops the removed ones (showing
+    /// another session when the shown one goes), reconnects one whose address changed.
+    fn set_machines(&mut self, specs: Vec<MachineSpec>, window: &mut Window, cx: &mut Context<Self>) {
+        let same = |a: &MachineSpec, b: &MachineSpec| format!("{:?}", a.endpoint) == format!("{:?}", b.endpoint);
+        let gone_shown = self.shown.as_ref().is_some_and(|k| !specs.iter().any(|s| &s.key == k && self.machine(k).is_some_and(|m| same(&m.spec, s))));
+        if gone_shown {
+            self.leave(window, cx);
+            self.shown = None;
+            self.tabs.update(cx, |tabs, cx| {
+                for id in tabs.tabs().iter().map(|t| t.id().to_string()).collect::<Vec<_>>() {
+                    tabs.remove(id, cx);
+                }
+            });
+        }
+        let mut old: Vec<Machine> = std::mem::take(&mut self.machines);
+        let mut reconnect = Vec::new();
+        for spec in specs {
+            match old.iter().position(|m| m.spec.key == spec.key) {
+                Some(i) if same(&old[i].spec, &spec) => {
+                    let mut m = old.remove(i);
+                    m.spec.name = spec.name;
+                    self.machines.push(m);
+                }
+                _ => {
+                    reconnect.push(spec.key.clone());
+                    self.machines.push(Machine { spec, control: None, model: SessionModel::default(), conn: ConnState::Connecting, tasks: Vec::new() });
+                }
+            }
+        }
+        for m in old {
+            if let Some(c) = m.control {
+                c.close();
+            }
+        }
+        for k in reconnect {
+            self.connect_machine(k, window, cx);
+        }
+        if self.shown.is_none() {
+            self.start = Some(Start { machine: None, session: None, strict: false });
+            if let Some(k) = self.machines.iter().find(|m| m.conn == ConnState::Connected).map(|m| m.spec.key.clone()) {
+                self.maybe_start(&k, window, cx);
+            }
+            self.save_state(window, cx);
+        }
+    }
 
     fn render_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let this = cx.weak_entity();
@@ -1070,6 +1167,20 @@ impl Workspace {
                             });
                         }
                     })
+                    .into_any_element(),
+            ),
+            Modal::Settings { view, .. } => Some(
+                Dialog::new("settings")
+                    .open(true)
+                    .title(t("Settings", "设置"))
+                    .w(px(640.))
+                    .track_focus(&view.focus_handle(cx))
+                    .on_open_change(move |open, window, cx| {
+                        if !open {
+                            let _ = this.update(cx, |this, cx| this.close_settings(window, cx));
+                        }
+                    })
+                    .child(view.clone())
                     .into_any_element(),
             ),
             Modal::Rename { input, .. } => Some(
