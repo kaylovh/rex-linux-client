@@ -2,6 +2,7 @@
 //! blocking interface. Paths are POSIX strings; callers run calls off the UI thread.
 
 pub mod local;
+pub mod rex;
 pub mod sftp;
 #[cfg(test)]
 pub(crate) mod conformance;

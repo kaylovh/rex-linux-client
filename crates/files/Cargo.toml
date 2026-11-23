@@ -6,3 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+rex-proto = { path = "../rex-proto" }
+serde_json.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+rex-proto = { path = "../rex-proto", features = ["test-hooks"] }
