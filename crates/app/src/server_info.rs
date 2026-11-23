@@ -99,6 +99,11 @@ pub fn reload_text(result: &Value) -> String {
     }
 }
 
+/// The rows, or why the server couldn't be asked (rows from failed calls would be junk).
+pub fn rows_or_error(version: Result<Value, String>, status: Result<Value, String>, clients: Result<Value, String>) -> Result<Vec<(String, String)>, String> {
+    Ok(info_rows(&version?, &status?, &clients?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +147,13 @@ mod tests {
         let empty = info_rows(&json!({}), &json!({"config":{"generation":1,"hash":""}}), &json!({}));
         assert_eq!(empty[3].1, "no config file");
         assert_eq!(empty[5].1, "none");
+    }
+
+    #[test]
+    fn a_failed_call_is_an_error_not_junk() {
+        let ok = Ok(json!({}));
+        assert_eq!(rows_or_error(ok.clone(), Err("timed out".into()), ok.clone()), Err("timed out".to_string()));
+        assert!(rows_or_error(Ok(version()), Ok(status()), Ok(clients())).is_ok());
     }
 
     #[test]

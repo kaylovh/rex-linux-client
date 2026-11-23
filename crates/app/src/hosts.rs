@@ -59,27 +59,31 @@ pub fn host_address(parent: &MachineSpec, endpoint: &str) -> Option<String> {
 /// The hosts of `parent` to show as machines: the ones chosen (`shown`), or by default all
 /// for a server here and none for a remote one; minus those that are a machine already
 /// (`known_host_ids`) and those that can't be reached.
-pub fn host_specs(parent: &MachineSpec, hosts: &[HostEntry], shown: Option<&[String]>, known_host_ids: &[String]) -> Vec<MachineSpec> {
-    hosts
-        .iter()
-        .filter(|h| match shown {
-            Some(labels) => labels.iter().any(|l| l == &h.label),
-            None => here(parent),
-        })
-        .filter(|h| h.host_id.as_ref().is_none_or(|id| !known_host_ids.contains(id)))
-        .filter_map(|h| {
-            let address = host_address(parent, h.endpoints.first()?)?;
-            let endpoint = Endpoint::parse(&address).ok()?;
-            Some(MachineSpec {
-                key: format!("h:{}/{}", parent.key, h.label),
-                name: h.label.clone(),
-                endpoint,
-                local: false,
-                address,
-                parent: Some(parent.key.clone()),
-            })
-        })
-        .collect()
+pub fn host_specs(parent: &MachineSpec, hosts: &[HostEntry], shown: Option<&[String]>, known_host_ids: &mut Vec<String>) -> Vec<MachineSpec> {
+    let mut out = Vec::new();
+    for h in hosts.iter().filter(|h| match shown {
+        Some(labels) => labels.iter().any(|l| l == &h.label),
+        None => here(parent),
+    }) {
+        if h.host_id.as_ref().is_some_and(|id| known_host_ids.contains(id)) {
+            continue;
+        }
+        let Some(address) = h.endpoints.first().and_then(|e| host_address(parent, e)) else { continue };
+        let Ok(endpoint) = Endpoint::parse(&address) else { continue };
+        // Listed again by another server: shown once.
+        if let Some(id) = &h.host_id {
+            known_host_ids.push(id.clone());
+        }
+        out.push(MachineSpec {
+            key: format!("h:{}/{}", parent.key, h.label),
+            name: h.label.clone(),
+            endpoint,
+            local: false,
+            address,
+            parent: Some(parent.key.clone()),
+        });
+    }
+    out
 }
 
 /// The labels chosen for `server`, if it was ever chosen.
@@ -104,6 +108,19 @@ pub fn toggle_shown(shown: &mut Vec<ShownHosts>, server: &str, label: &str, visi
         }
         None => hosts.push(label.to_string()),
     }
+}
+
+/// `base` (machines that aren't hosts) with each one's shown hosts right after it, from the
+/// hosts each server last listed (kept while it reconnects); a host already shown, or one
+/// whose host_id is in `known` (the base machines' own), appears once.
+pub fn machines_with_hosts(base: Vec<MachineSpec>, hosts_of: impl Fn(&str) -> Vec<HostEntry>, shown: &[ShownHosts], mut known: Vec<String>) -> Vec<MachineSpec> {
+    let mut out = Vec::new();
+    for spec in base {
+        let hosts = host_specs(&spec, &hosts_of(&spec.key), shown_for(shown, &spec.key), &mut known);
+        out.push(spec);
+        out.extend(hosts);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -146,23 +163,23 @@ mod tests {
     #[test]
     fn local_parent_shows_all_by_default() {
         let local = spec("local", "", true);
-        let s = host_specs(&local, &[host("a", "a.ts.net", None), host("b", "unix:///tmp/b.sock", None)], None, &[]);
+        let s = host_specs(&local, &[host("a", "a.ts.net", None), host("b", "unix:///tmp/b.sock", None)], None, &mut vec![]);
         assert_eq!(s.iter().map(|m| m.key.as_str()).collect::<Vec<_>>(), ["h:local/a", "h:local/b"]);
         assert_eq!(s[1].address, "unix:///tmp/b.sock");
         assert_eq!(s[0].parent.as_deref(), Some("local"));
         assert!(!s[0].local);
         // Chosen: only those.
         let only = ["b".to_string()];
-        assert_eq!(host_specs(&local, &[host("a", "a.ts.net", None), host("b", "unix:///tmp/b.sock", None)], Some(&only), &[]).len(), 1);
+        assert_eq!(host_specs(&local, &[host("a", "a.ts.net", None), host("b", "unix:///tmp/b.sock", None)], Some(&only), &mut vec![]).len(), 1);
     }
 
     #[test]
     fn remote_parent_shows_none_until_chosen() {
         let dev = spec("m:dev", "ssh://me@dev", false);
         let hosts = [host("a", "a.ts.net", None)];
-        assert!(host_specs(&dev, &hosts, None, &[]).is_empty());
+        assert!(host_specs(&dev, &hosts, None, &mut vec![]).is_empty());
         let chosen = ["a".to_string()];
-        let s = host_specs(&dev, &hosts, Some(&chosen), &[]);
+        let s = host_specs(&dev, &hosts, Some(&chosen), &mut vec![]);
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].address, "ssh://me@dev#a.ts.net");
     }
@@ -184,11 +201,26 @@ mod tests {
     #[test]
     fn known_host_ids_are_skipped() {
         let local = spec("local", "", true);
-        let s = host_specs(&local, &[host("mac", "mac.ts.net", Some("hid-mac")), host("pi", "pi.ts.net", Some("hid-pi"))], None, &["hid-mac".into()]);
+        let s = host_specs(&local, &[host("mac", "mac.ts.net", Some("hid-mac")), host("pi", "pi.ts.net", Some("hid-pi"))], None, &mut vec!["hid-mac".into()]);
         assert_eq!(s.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["pi"]);
         // No usable address: skipped too.
         let none = HostEntry { label: "n".into(), endpoints: vec![], host_id: None };
-        assert!(host_specs(&local, &[none], None, &[]).is_empty());
+        assert!(host_specs(&local, &[none], None, &mut vec![]).is_empty());
+    }
+
+    #[test]
+    fn same_host_from_two_servers_once() {
+        let local = spec("local", "", true);
+        let dev = spec("m:dev", "ssh://me@dev", false);
+        let mac = [host("mac", "mac.ts.net", Some("hid-mac"))];
+        let chosen = ["mac".to_string()];
+        let all = machines_with_hosts(
+            vec![local, dev],
+            |k| if k == "local" || k == "m:dev" { mac.to_vec() } else { vec![] },
+            &[ShownHosts { server: "m:dev".into(), hosts: chosen.to_vec() }],
+            vec![],
+        );
+        assert_eq!(all.iter().map(|m| m.key.as_str()).collect::<Vec<_>>(), ["local", "h:local/mac", "m:dev"]);
     }
 
     #[test]

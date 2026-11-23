@@ -25,7 +25,7 @@ use rexterm::terminal::{Terminal, TerminalState};
 use serde_json::{Value, json};
 
 use crate::config::{self, Settings, WorkspaceState};
-use crate::hosts::{HostEntry, host_specs, parse_hosts, shown_by_default, shown_for};
+use crate::hosts::{HostEntry, machines_with_hosts, parse_hosts, shown_by_default};
 use crate::i18n::t;
 use crate::keys::gui_command;
 use crate::machines::{ConnState, MachineSpec, StartChoice, after_reconnect, start_choice, state_target, status_line};
@@ -735,6 +735,12 @@ impl Workspace {
         if let Some(old) = entry.terminal.take() {
             old.update(cx, |t, cx| t.close(cx));
         }
+        // A re-attached pane gets a new terminal: a search bar on the old one goes.
+        if let Modal::Search { block: b, .. } = &self.modal
+            && *b == block.block_id
+        {
+            self.modal = Modal::None;
+        }
         let (source, events) = RexSource::new(block.clone(), attached);
         let engine = source.engine();
         let terminal = cx.new(|cx| TerminalState::new(engine, terminal_config(&self.settings.font), window, cx));
@@ -799,6 +805,22 @@ impl Workspace {
             Some("rexa_reconnecting") => m.conn = ConnState::Reconnecting,
             Some("rexa_reconnected") => {
                 m.conn = ConnState::Connected;
+                if ev["resumed"] != true
+                    && m.spec.parent.is_none()
+                    && let Some(c) = m.control.clone()
+                {
+                    let k = key.to_string();
+                    self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+                        let hosts = cx.background_spawn(async move { list_hosts(&c) }).await;
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            if let Some(m) = this.machine_mut(&k) {
+                                m.hosts = hosts;
+                            }
+                            this.sync_hosts(window, cx);
+                        });
+                    }));
+                }
+                let Some(m) = self.machine_mut(key) else { return };
                 if ev["resumed"] != true {
                     // A new client: attach everything again.
                     if let Some(c) = m.control.clone() {
@@ -1009,9 +1031,15 @@ impl Workspace {
     /// terminal see them.
     fn on_keystroke(&mut self, ev: &KeystrokeEvent, window: &mut Window, cx: &mut Context<Self>) {
         // A dialog takes every key: typing a name must not start commands.
-        if !matches!(self.modal, Modal::None) {
+        let search_focused = match &self.modal {
+            Modal::Search { input, .. } => Some(input.read(cx).focus_handle(cx).is_focused(window)),
+            _ => None,
+        };
+        // A dialog, or the search field, takes every key: typing must not start commands.
+        // With the search bar open but the terminal focused, keys work as usual.
+        if !matches!(self.modal, Modal::None) && search_focused != Some(false) {
             self.prefix = false;
-            if matches!(self.modal, Modal::Search { .. }) && ev.keystroke.key == "escape" {
+            if search_focused == Some(true) && ev.keystroke.key == "escape" {
                 self.close_search(window, cx);
                 cx.stop_propagation();
             }
@@ -1083,7 +1111,7 @@ impl Workspace {
             .collect();
         self.palette_entries = entries;
         self.palette.update(cx, |p, cx| p.set_entries(items, cx));
-        self.modal = Modal::Palette;
+        self.set_modal(Modal::Palette, cx);
         let _ = window;
         cx.notify();
     }
@@ -1112,7 +1140,7 @@ impl Workspace {
             }
         });
         input.update(cx, |i, cx| i.focus(window, cx));
-        self.modal = Modal::Rename { machine, session, input, _sub: sub };
+        self.set_modal(Modal::Rename { machine, session, input, _sub: sub }, cx);
         cx.notify();
     }
 
@@ -1142,11 +1170,19 @@ impl Workspace {
             InputEvent::PressEnter { shift, .. } => term.update(cx, |t, cx| t.search_step(!shift, cx)),
             InputEvent::Blur | InputEvent::Focus => {}
         });
+        self.set_modal(Modal::Search { block, input: input.clone(), _sub: sub }, cx);
         input.update(cx, |i, cx| i.focus(window, cx));
-        if let Modal::Search { .. } = self.modal {
-            self.close_search(window, cx);
+        cx.notify();
+    }
+
+    /// Puts up another dialog; a search bar it replaces stops searching (no highlights left).
+    fn set_modal(&mut self, modal: Modal, cx: &mut Context<Self>) {
+        if let Modal::Search { block, .. } = &self.modal
+            && let Some(term) = self.panes.terminal(block).cloned()
+        {
+            term.update(cx, |t, cx| t.search(None, cx));
         }
-        self.modal = Modal::Search { block, input, _sub: sub };
+        self.modal = modal;
         cx.notify();
     }
 
@@ -1205,7 +1241,7 @@ impl Workspace {
     fn open_server_info(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
         let connected = self.machine(&key).is_some_and(|m| m.control.is_some() && m.conn == ConnState::Connected);
         let message = (!connected).then(|| t("This machine isn't connected.", "这台机器没有连接。").to_string());
-        self.modal = Modal::ServerInfo { machine: key.clone(), rows: if connected { None } else { Some(Vec::new()) }, message };
+        self.set_modal(Modal::ServerInfo { machine: key.clone(), rows: if connected { None } else { Some(Vec::new()) }, message }, cx);
         if connected {
             self.load_server_info(key, window, cx);
         }
@@ -1213,19 +1249,28 @@ impl Workspace {
     }
 
     fn load_server_info(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(control) = self.machine(&key).and_then(|m| m.control.clone()) else { return };
+        let Some(control) = self.machine(&key).filter(|m| m.conn == ConnState::Connected).and_then(|m| m.control.clone()) else { return };
+        if let Modal::ServerInfo { rows, .. } = &mut self.modal {
+            *rows = None;
+        }
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
             let rows = cx
                 .background_spawn(async move {
-                    let call = |m: &str| control.call(m, json!({})).unwrap_or(Value::Null);
-                    crate::server_info::info_rows(&call("server.version"), &call("server.status"), &call("client.list"))
+                    let call = |m: &str| control.call(m, json!({})).map_err(|e| e.to_string());
+                    crate::server_info::rows_or_error(call("server.version"), call("server.status"), call("client.list"))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if let Modal::ServerInfo { machine, rows: slot, .. } = &mut this.modal
+                if let Modal::ServerInfo { machine, rows: slot, message } = &mut this.modal
                     && *machine == key
                 {
-                    *slot = Some(rows);
+                    match rows {
+                        Ok(rows) => *slot = Some(rows),
+                        Err(e) => {
+                            *slot = Some(Vec::new());
+                            *message = Some(format!("{}{e}", t("Can't ask the server: ", "无法读取服务端信息:")));
+                        }
+                    }
                     cx.notify();
                 }
             });
@@ -1277,7 +1322,7 @@ impl Workspace {
                 }
             }
         });
-        self.modal = Modal::Settings { view, _sub: sub };
+        self.set_modal(Modal::Settings { view, _sub: sub }, cx);
         cx.notify();
     }
 
@@ -1319,20 +1364,10 @@ impl Workspace {
         Ok(())
     }
 
-    /// `base` (machines that aren't Rex hosts) with each one's shown hosts right after it.
+    /// `base` with each server's shown Rex hosts after it (from the hosts it last listed).
     fn with_hosts(&self, base: Vec<MachineSpec>) -> Vec<MachineSpec> {
         let known: Vec<String> = self.machines.iter().filter(|m| m.spec.parent.is_none()).filter_map(|m| m.host_id.clone()).collect();
-        let mut out = Vec::new();
-        for spec in base {
-            let hosts = self
-                .machine(&spec.key)
-                .filter(|m| m.conn == ConnState::Connected)
-                .map(|m| host_specs(&spec, &m.hosts, shown_for(&self.settings.shown_hosts, &spec.key), &known))
-                .unwrap_or_default();
-            out.push(spec);
-            out.extend(hosts);
-        }
-        out
+        machines_with_hosts(base, |k| self.machine(k).map(|m| m.hosts.clone()).unwrap_or_default(), &self.settings.shown_hosts, known)
     }
 
     /// Brings the Rex host machines in line with what the servers list and the settings show.
@@ -1450,7 +1485,7 @@ impl Workspace {
                 if let Some(m) = message {
                     body = body.child(div().pt_2().text_sm().child(m.clone()));
                 }
-                let connected = self.machine(machine).is_some_and(|m| m.control.is_some());
+                let connected = self.machine(machine).is_some_and(|m| m.control.is_some() && m.conn == ConnState::Connected);
                 let (k1, k2) = (machine.clone(), machine.clone());
                 let mut footer = div().flex().gap_2();
                 if connected {
