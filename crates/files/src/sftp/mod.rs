@@ -148,6 +148,11 @@ impl Conn {
 
     /// The names and attributes in a directory, without . and ..
     fn read_dir(&mut self, path: &str) -> Result<Vec<(String, Attrs)>, Fail> {
+        Ok(self.read_dir_long(path)?.into_iter().map(|(n, _, a)| (n, a)).collect())
+    }
+
+    /// Also with each entry's long name (ls -l style: the second field is the link count).
+    fn read_dir_long(&mut self, path: &str) -> Result<Vec<(String, String, Attrs)>, Fail> {
         let h = self.handle(wire::OPENDIR, |o| o.str(path))?;
         let mut out = Vec::new();
         let result = loop {
@@ -155,13 +160,18 @@ impl Conn {
                 Ok((wire::NAME, body)) => {
                     let mut r = In::new(&body);
                     let Ok(count) = r.u32() else { break Err(Fail::Bad("short name".into())) };
+                    let mut bad = false;
                     for _ in 0..count {
-                        let (Ok(name), Ok(_long), Ok(a)) = (r.string(), r.bytes(), r.attrs()) else {
-                            return Err(Fail::Bad("short name".into()));
+                        let (Ok(name), Ok(long), Ok(a)) = (r.string(), r.string(), r.attrs()) else {
+                            bad = true;
+                            break;
                         };
                         if name != "." && name != ".." {
-                            out.push((name, a));
+                            out.push((name, long, a));
                         }
+                    }
+                    if bad {
+                        break Err(Fail::Bad("short name".into()));
                     }
                 }
                 Ok((t, body)) => match Self::status_of(t, &body) {
@@ -432,10 +442,11 @@ impl FileSystem for SftpFs {
         })
     }
 
-    fn write_file(&self, path: &str, bytes: &[u8], create_new: bool) -> Result<(), FsError> {
+    fn write_file(&self, path: &str, bytes: &[u8], create_new: bool, mode: Option<u32>) -> Result<(), FsError> {
         self.with(|c| {
             let flags = wire::WRITE_FLAG | wire::CREAT | if create_new { wire::EXCL } else { wire::TRUNC };
-            let h = match c.handle(wire::OPEN, |o| o.str(path).u32(flags).attrs(&Attrs::default())) {
+            let attrs = Attrs { permissions: mode.filter(|_| create_new).map(|m| m & 0o7777), ..Default::default() };
+            let h = match c.handle(wire::OPEN, |o| o.str(path).u32(flags).attrs(&attrs)) {
                 Ok(h) => h,
                 Err(e) if create_new => return Err(exists_or(c, path, e)),
                 Err(e) => return Err(e),
@@ -458,6 +469,18 @@ impl FileSystem for SftpFs {
             result.and(closed)
         })
         .map_err(exists_err)
+    }
+
+    fn link_count(&self, path: &str) -> Result<Option<u64>, FsError> {
+        // SFTP v3 has no link count; the long name in the folder's listing does.
+        let real = self.resolve(path)?;
+        let (Some(dir), Some(name)) = (crate::parent(&real), real.rsplit('/').next().map(str::to_string)) else { return Ok(None) };
+        self.with(|c| {
+            Ok(c.read_dir_long(&dir)?
+                .into_iter()
+                .find(|(n, _, _)| *n == name)
+                .and_then(|(_, long, _)| long.split_whitespace().nth(1)?.parse::<u64>().ok()))
+        })
     }
 
     fn set_mode(&self, path: &str, mode: u32) -> Result<(), FsError> {

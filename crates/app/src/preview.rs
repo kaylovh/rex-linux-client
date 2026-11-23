@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use files::FileSystem;
-use files::save::{Eol, InPlaceReason, SaveError, Saved, Version, detect_eol, safe_save, save_in_place, version_of, with_eol};
+use files::save::{Eol, InPlaceReason, SaveError, Saved, Version, create_new, detect_eol, safe_save, save_in_place, with_eol};
 use gpui_cn::{Button, ButtonSize};
 use gpui_kit::base::input::InputEvent;
 use gpui_kit::component::input::{Editor, EditorState};
@@ -243,7 +243,7 @@ impl PreviewPanel {
                                 let text = String::from_utf8_lossy(&bytes).into_owned();
                                 let note = (!utf8).then(|| t("Not UTF-8: shown as best it can be; it can't be edited.", "不是 UTF-8:尽量显示,不能编辑。").to_string());
                                 let block = edit_block_reason(source.as_deref(), size, utf8);
-                                Content::Text(Box::new(text_tab(text, language, note, block, Some(version_of(&entry)), window, cx)))
+                                Content::Text(Box::new(text_tab(text, language, note, block, Some(Version::read(&entry, &bytes)), window, cx)))
                             }
                         }
                     }
@@ -338,8 +338,9 @@ impl PreviewPanel {
 
     /// Whether the editor of the shown tab has the keyboard.
     pub fn editor_focused(&self, window: &Window, cx: &App) -> bool {
+        // A read-only preview leaves the window's shortcuts alone.
         match self.tabs.get(self.active).map(|t| &t.content) {
-            Some(Content::Text(t)) => t.editor.read(cx).focus_handle(cx).is_focused(window),
+            Some(Content::Text(t)) => t.editing && t.editor.read(cx).focus_handle(cx).is_focused(window),
             _ => false,
         }
     }
@@ -366,30 +367,42 @@ impl PreviewPanel {
         let Some(tab) = self.tabs.get(i) else { return };
         let (fs, machine, source, path, new_file) = (tab.fs.clone(), tab.machine.clone(), tab.source.clone(), tab.path.clone(), tab.new_file);
         let Some(text) = self.text_mut(i) else { return };
-        if !text.editing || text.saving {
+        // Nothing to write: no edits (a new file is written even empty).
+        if !text.editing || text.saving || !(text.dirty || new_file || force) {
             return;
         }
         text.saving = true;
         text.message = None;
         let lf = text.editor.read(cx).value().to_string();
         let bytes = with_eol(&lf, text.eol).into_bytes();
-        let expected = if force || new_file { None } else { text.base.clone() };
+        let expected = if force { None } else { text.base.clone() };
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let (fs2, p2, b2, e2) = (fs.clone(), path.clone(), bytes.clone(), expected.clone());
-            let result = cx.background_spawn(async move { safe_save(&*fs2, &p2, &b2, e2.as_ref()) }).await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.saved(&machine, &source, &path, lf.clone(), result, window, cx);
-                let Some(i) = this.find(&machine, &source, &path) else { return };
-                let _ = (fs, bytes, expected, i);
-            });
+            let p = path.clone();
+            let result = cx
+                .background_spawn(async move {
+                    // A new file never replaces one made meanwhile (unless Overwrite was chosen).
+                    if new_file && !force { create_new(&*fs, &p, &bytes) } else { safe_save(&*fs, &p, &bytes, expected.as_ref()) }
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| this.saved(&machine, &source, &path, lf, force, result, window, cx));
         })
         .detach();
     }
 
     /// What a save came back with.
     #[allow(clippy::too_many_arguments)]
-    fn saved(&mut self, machine: &str, source: &Option<String>, path: &str, lf: String, result: Result<Saved, SaveError>, window: &mut Window, cx: &mut Context<Self>) {
+    fn saved(
+        &mut self,
+        machine: &str,
+        source: &Option<String>,
+        path: &str,
+        lf: String,
+        force: bool,
+        result: Result<Saved, SaveError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(i) = self.find(machine, source, path) else { return };
         if let Some(t) = self.text_mut(i) {
             t.saving = false;
@@ -412,13 +425,20 @@ impl PreviewPanel {
                 match self.after_save.clone() {
                     AfterSave::Close(m, s, p) if m == machine && &s == source && p == path => {
                         self.after_save = AfterSave::Nothing;
-                        if let Some(i) = self.find(&m, &s, &p) {
+                        // Typed into while it saved: ask again rather than lose that.
+                        if let Some(i) = self.find(&m, &s, &p)
+                            && !self.is_dirty(i)
+                        {
                             self.close(i, cx);
                         }
                     }
                     AfterSave::Quit if self.dirty_names().is_empty() => {
                         self.after_save = AfterSave::Nothing;
                         cx.emit(PreviewEvent::AllSaved);
+                    }
+                    // Every save is back and something is still unsaved: the quit is off.
+                    AfterSave::Quit if !self.tabs.iter().any(|t| matches!(&t.content, Content::Text(x) if x.saving)) => {
+                        self.after_save = AfterSave::Nothing;
                     }
                     _ => {}
                 }
@@ -441,7 +461,13 @@ impl PreviewPanel {
                     let _ = this.update_in(cx, |this, window, cx| {
                         let Some(i) = this.find(&m, &s, &p) else { return };
                         match choice {
-                            Ok(0) => this.save(i, true, window, cx),
+                            Ok(0) => {
+                                // Overwrite: the file as it is now is the one to replace.
+                                if let Some(t) = this.text_mut(i) {
+                                    t.dirty = true;
+                                }
+                                this.save(i, true, window, cx);
+                            }
                             Ok(1) => this.reload(i, window, cx),
                             _ => {}
                         }
@@ -470,10 +496,25 @@ impl PreviewPanel {
                     }
                     let _ = this.update_in(cx, |this, window, cx| {
                         let Some(i) = this.find(&m, &s, &p) else { return };
-                        this.save_in_place(i, window, cx);
+                        this.save_in_place(i, force, window, cx);
                     });
                 })
                 .detach();
+            }
+            Err(SaveError::InPlaceFailed { error, restored, backup }) => {
+                if let Some(t) = self.text_mut(i) {
+                    let how = if restored {
+                        t_("Not saved; the file was put back as it was.", "未保存;文件已恢复原样。")
+                    } else {
+                        t_("Not saved, and the file couldn't be put back — restore it from the backup.", "未保存,且无法恢复原文件——请用备份恢复。")
+                    };
+                    t.message = Some(format!(
+                        "{how} {} {}: {}",
+                        crate::file_panel::fs_error_text(&error),
+                        t_("Backup", "备份"),
+                        backup.display()
+                    ));
+                }
             }
             Err(SaveError::Fs(e)) => {
                 if let Some(t) = self.text_mut(i) {
@@ -484,20 +525,27 @@ impl PreviewPanel {
         cx.notify();
     }
 
-    fn save_in_place(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn save_in_place(&mut self, i: usize, force: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(i) else { return };
         let (fs, machine, source, path) = (tab.fs.clone(), tab.machine.clone(), tab.source.clone(), tab.path.clone());
+        let Some(backups) = crate::config::backup_dir(|k| std::env::var(k).ok()) else {
+            if let Some(t) = self.text_mut(i) {
+                t.message = Some(t_("Not saved: no folder for the backup (HOME isn't set).", "未保存:没有放备份的文件夹(未设置 HOME)。").into());
+            }
+            cx.notify();
+            return;
+        };
         let Some(text) = self.text_mut(i) else { return };
         text.saving = true;
         let lf = text.editor.read(cx).value().to_string();
         let bytes = with_eol(&lf, text.eol).into_bytes();
-        let expected = text.base.clone();
-        let Some(backups) = crate::config::backup_dir(|k| std::env::var(k).ok()) else { return };
+        // After Overwrite, the file as it is now is the one replaced.
+        let expected = if force { None } else { text.base.clone() };
         cx.spawn_in(window, async move |this, cx| {
             let m2 = machine.clone();
             let p2 = path.clone();
             let result = cx.background_spawn(async move { save_in_place(&*fs, &p2, &bytes, expected.as_ref(), &backups, &m2) }).await;
-            let _ = this.update_in(cx, |this, window, cx| this.saved(&machine, &source, &path, lf, result, window, cx));
+            let _ = this.update_in(cx, |this, window, cx| this.saved(&machine, &source, &path, lf, force, result, window, cx));
         })
         .detach();
     }
@@ -511,14 +559,22 @@ impl PreviewPanel {
             let read = cx
                 .background_spawn(async move {
                     let e = fs.stat_target(&p)?;
-                    Ok::<_, files::FsError>((version_of(&e), fs.read(&p, EDIT_MAX + 1)?))
+                    let bytes = fs.read(&p, EDIT_MAX + 1)?;
+                    Ok::<_, files::FsError>((Version::read(&e, &bytes), e.size.unwrap_or(0).max(bytes.len() as u64), bytes))
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let Some(i) = this.find(&machine, &source, &path) else { return };
+                let source_tag = this.tabs[i].source.clone();
                 let Some(t) = this.text_mut(i) else { return };
                 match read {
-                    Ok((v, bytes)) => {
+                    Ok((v, size, bytes)) => {
+                        // It may have grown past the edit limit or stopped being UTF-8.
+                        let utf8 = std::str::from_utf8(&bytes).is_ok();
+                        t.block = edit_block_reason(source_tag.as_deref(), size, utf8);
+                        if t.block.is_some() {
+                            t.editing = false;
+                        }
                         let raw = String::from_utf8_lossy(&bytes).into_owned();
                         t.eol = detect_eol(&raw);
                         let lf = raw.replace("\r\n", "\n");

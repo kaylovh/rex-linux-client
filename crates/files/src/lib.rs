@@ -101,8 +101,13 @@ pub trait FileSystem: Send + Sync {
     fn writable(&self) -> Result<(), String>;
     /// The absolute path with every link followed; NotFound when it leads nowhere.
     fn resolve(&self, path: &str) -> Result<String, FsError>;
-    /// Writes a whole file: a new one (Exists if anything is there) or over an existing one.
-    fn write_file(&self, path: &str, bytes: &[u8], create_new: bool) -> Result<(), FsError>;
+    /// Writes a whole file: a new one (Exists if anything is there; created with `mode` when
+    /// given, so it is never more open than that) or over an existing one.
+    fn write_file(&self, path: &str, bytes: &[u8], create_new: bool, mode: Option<u32>) -> Result<(), FsError>;
+    /// How many hard links the file has, when the source can tell.
+    fn link_count(&self, path: &str) -> Result<Option<u64>, FsError> {
+        self.stat_target(path).map(|e| e.nlink)
+    }
     /// Sets the permission bits.
     fn set_mode(&self, path: &str, mode: u32) -> Result<(), FsError>;
     /// Renames `from` to `to` in one step, replacing `to`; Unsupported when the server can't.

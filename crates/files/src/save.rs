@@ -8,14 +8,31 @@ use std::time::SystemTime;
 
 use crate::{FileEntry, FileSystem, FsError};
 
+/// What a file was when it was read or saved: size and time, and a hash of its contents when
+/// known (times can be whole seconds, so a same-size change within one is caught by it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
     pub size: u64,
+    /// None: unknown (the file was written but couldn't be looked at after).
     pub modified: Option<SystemTime>,
+    pub hash: Option<u64>,
 }
 
 pub fn version_of(e: &FileEntry) -> Version {
-    Version { size: e.size.unwrap_or(0), modified: e.modified }
+    Version { size: e.size.unwrap_or(0), modified: e.modified, hash: None }
+}
+
+fn hash(bytes: &[u8]) -> u64 {
+    let mut h = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(bytes, &mut h);
+    std::hash::Hasher::finish(&h)
+}
+
+impl Version {
+    /// The version of a file whose entry and contents were just read.
+    pub fn read(e: &FileEntry, bytes: &[u8]) -> Version {
+        Version { hash: Some(hash(bytes)), ..version_of(e) }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +47,9 @@ pub enum SaveError {
     /// The file changed since `expected` was read.
     Changed { now: Version },
     NeedsInPlace(InPlaceReason),
+    /// Writing in place failed; whether the old contents were put back, and where the
+    /// backup of them is.
+    InPlaceFailed { error: FsError, restored: bool, backup: std::path::PathBuf },
     Fs(FsError),
 }
 
@@ -56,18 +76,49 @@ fn split(real: &str) -> (&str, &str) {
     }
 }
 
-fn temp_name(dir: &str, name: &str) -> String {
+fn random_hex() -> Result<String, SaveError> {
     let mut b = [0u8; 4];
-    let _ = getrandom::fill(&mut b);
-    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    let dir = if dir == "/" { "" } else { dir };
-    format!("{dir}/.{name}.rexa-{hex}.tmp")
+    getrandom::fill(&mut b).map_err(|e| SaveError::Fs(FsError::Other(format!("random: {e}"))))?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
-fn check(cur: &FileEntry, expected: Option<&Version>) -> Result<(), SaveError> {
-    match expected {
-        Some(exp) if &version_of(cur) != exp => Err(SaveError::Changed { now: version_of(cur) }),
-        _ => Ok(()),
+fn temp_name(dir: &str, name: &str) -> Result<String, SaveError> {
+    let dir = if dir == "/" { "" } else { dir };
+    Ok(format!("{dir}/.{name}.rexa-{}.tmp", random_hex()?))
+}
+
+/// The file is still the expected version: same size and time (when known), and the same
+/// contents when a hash was taken.
+fn check(fs: &dyn FileSystem, real: &str, cur: &FileEntry, expected: Option<&Version>) -> Result<(), SaveError> {
+    let Some(exp) = expected else { return Ok(()) };
+    let now = version_of(cur);
+    let changed = now.size != exp.size || (exp.modified.is_some() && now.modified != exp.modified);
+    if changed {
+        return Err(SaveError::Changed { now });
+    }
+    if let Some(h) = exp.hash {
+        let bytes = fs.read(real, exp.size.saturating_add(1)).map_err(SaveError::Fs)?;
+        let now = Version::read(cur, &bytes);
+        if now.hash != Some(h) {
+            return Err(SaveError::Changed { now });
+        }
+    }
+    Ok(())
+}
+
+/// Creates a new file; something already there (made since the editor opened) is a change,
+/// never overwritten.
+pub fn create_new(fs: &dyn FileSystem, path: &str, bytes: &[u8]) -> Result<Saved, SaveError> {
+    match fs.write_file(path, bytes, true, None) {
+        Ok(()) => {
+            let version = fs.stat_target(path).map(|e| Version::read(&e, bytes)).unwrap_or(Version { size: bytes.len() as u64, modified: None, hash: Some(hash(bytes)) });
+            Ok(Saved { version, path: path.to_string(), fallback_note: false })
+        }
+        Err(FsError::Exists) => {
+            let now = fs.stat_target(path).map(|e| version_of(&e)).map_err(SaveError::Fs)?;
+            Err(SaveError::Changed { now })
+        }
+        Err(e) => Err(SaveError::Fs(e)),
     }
 }
 
@@ -77,31 +128,37 @@ fn check(cur: &FileEntry, expected: Option<&Version>) -> Result<(), SaveError> {
 pub fn safe_save(fs: &dyn FileSystem, path: &str, bytes: &[u8], expected: Option<&Version>) -> Result<Saved, SaveError> {
     let real = match fs.resolve(path) {
         Ok(r) => r,
-        Err(FsError::NotFound) if expected.is_none() => {
-            fs.write_file(path, bytes, true).map_err(SaveError::Fs)?;
-            let version = version_of(&fs.stat_target(path).map_err(SaveError::Fs)?);
-            return Ok(Saved { version, path: path.to_string(), fallback_note: false });
-        }
+        Err(FsError::NotFound) if expected.is_none() => return create_new(fs, path, bytes),
         Err(e) => return Err(SaveError::Fs(e)),
     };
     let cur = fs.stat_target(&real).map_err(SaveError::Fs)?;
-    check(&cur, expected)?;
-    if cur.nlink.is_some_and(|n| n > 1) {
+    check(fs, &real, &cur, expected)?;
+    if fs.link_count(&real).map_err(SaveError::Fs)?.is_some_and(|n| n > 1) {
         return Err(SaveError::NeedsInPlace(InPlaceReason::HardLinks));
     }
     let (dir, name) = split(&real);
-    let tmp = temp_name(dir, name);
-    match fs.write_file(&tmp, bytes, true) {
+    let tmp = temp_name(dir, name)?;
+    // Private from its first byte: it may hold what a 600 file holds.
+    match fs.write_file(&tmp, bytes, true, Some(0o600)) {
         Ok(()) => {}
-        Err(FsError::Denied) => return Err(SaveError::NeedsInPlace(InPlaceReason::FolderNotWritable)),
+        // Not ours: never removed.
+        Err(FsError::Exists) => return Err(SaveError::Fs(FsError::Exists)),
+        Err(FsError::Denied) => {
+            let _ = fs.remove(&tmp);
+            return Err(SaveError::NeedsInPlace(InPlaceReason::FolderNotWritable));
+        }
         Err(e) => {
             let _ = fs.remove(&tmp);
             return Err(SaveError::Fs(e));
         }
     }
-    let drop_tmp = |e: SaveError| {
-        let _ = fs.remove(&tmp);
-        e
+    // Removes the temp; when it can't be removed, the error says where it is.
+    let drop_tmp = |e: SaveError| match fs.remove(&tmp) {
+        Ok(()) => e,
+        Err(_) => match e {
+            SaveError::Fs(inner) => SaveError::Fs(FsError::Other(format!("{inner}; a private temporary copy is left at {tmp}"))),
+            other => other,
+        },
     };
     if let Some(mode) = cur.mode {
         fs.set_mode(&tmp, mode & 0o7777).map_err(|e| drop_tmp(SaveError::Fs(e)))?;
@@ -122,7 +179,11 @@ pub fn safe_save(fs: &dyn FileSystem, path: &str, bytes: &[u8], expected: Option
         }
         Err(e) => return Err(drop_tmp(SaveError::Fs(e))),
     }
-    let version = version_of(&fs.stat_target(&real).map_err(SaveError::Fs)?);
+    // Saved: if the file can't be looked at now, its version is what was written.
+    let version = fs
+        .stat_target(&real)
+        .map(|e| Version::read(&e, bytes))
+        .unwrap_or(Version { size: bytes.len() as u64, modified: None, hash: Some(hash(bytes)) });
     Ok(Saved { version, path: real, fallback_note })
 }
 
@@ -138,20 +199,31 @@ pub fn save_in_place(
 ) -> Result<Saved, SaveError> {
     let real = fs.resolve(path).map_err(SaveError::Fs)?;
     let cur = fs.stat_target(&real).map_err(SaveError::Fs)?;
-    check(&cur, expected)?;
+    check(fs, &real, &cur, expected)?;
     let old = fs.read(&real, u64::MAX).map_err(SaveError::Fs)?;
     let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let safe = |s: &str| s.replace(['/', ':', '\\'], "_");
-    let backup = backup_dir.join(format!("{stamp}-{}-{}", safe(machine), safe(split(&real).1)));
-    std::fs::create_dir_all(backup_dir)
-        .and_then(|_| std::fs::write(&backup, &old))
-        .map_err(|e| SaveError::Fs(FsError::Other(format!("backup {}: {e}", backup.display()))))?;
-    if let Err(e) = fs.write_file(&real, bytes, false) {
-        let _ = fs.write_file(&real, &old, false);
-        return Err(SaveError::Fs(e));
+    let backup = backup_dir.join(format!("{stamp}-{}-{}-{}", random_hex()?, safe(machine), safe(split(&real).1)));
+    write_private(backup_dir, &backup, &old).map_err(|e| SaveError::Fs(FsError::Other(format!("backup {}: {e}", backup.display()))))?;
+    if let Err(error) = fs.write_file(&real, bytes, false, None) {
+        let restored = fs.write_file(&real, &old, false, None).is_ok();
+        return Err(SaveError::InPlaceFailed { error, restored, backup });
     }
-    let version = version_of(&fs.stat_target(&real).map_err(SaveError::Fs)?);
+    let version = fs
+        .stat_target(&real)
+        .map(|e| Version::read(&e, bytes))
+        .unwrap_or(Version { size: bytes.len() as u64, modified: None, hash: Some(hash(bytes)) });
     Ok(Saved { version, path: real, fallback_note: false })
+}
+
+/// Writes a backup only its owner can read, in a folder only its owner can enter.
+fn write_private(dir: &Path, file: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(file)?;
+    f.write_all(bytes)?;
+    f.sync_all()
 }
 
 /// CRLF when the first line break is one.
@@ -177,6 +249,7 @@ pub(crate) mod tests {
     use crate::{Kind, Listing};
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     fn root(name: &str) -> String {
         let d = std::env::temp_dir().join(format!("rexa-save-{}-{name}", std::process::id()));
@@ -255,8 +328,17 @@ pub(crate) mod tests {
         ip.unwrap();
         assert_eq!(fs::read(format!("{ro}/f")).unwrap(), b"in place");
         assert_eq!(fs::metadata(format!("{ro}/f")).unwrap().ino(), ino);
-        let kept: Vec<_> = fs::read_dir(&backups).unwrap().map(|e| fs::read(e.unwrap().path()).unwrap()).collect();
-        assert_eq!(kept, vec![b"keep".to_vec()]);
+        let kept: Vec<_> = fs::read_dir(&backups).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(kept.iter().map(|p| fs::read(p).unwrap()).collect::<Vec<_>>(), vec![b"keep".to_vec()]);
+        assert_eq!(fs::metadata(&kept[0]).unwrap().permissions().mode() & 0o777, 0o600);
+
+        // Hard links: replacing would split them.
+        let a = format!("{root}/linked");
+        fs::write(&a, b"x").unwrap();
+        fs::hard_link(&a, format!("{root}/linked2")).unwrap();
+        let v = version(f, &a);
+        assert_eq!(safe_save(f, &a, b"y", Some(&v)), Err(SaveError::NeedsInPlace(InPlaceReason::HardLinks)));
+        assert!(temps(root).is_empty());
     }
 
     #[test]
@@ -276,9 +358,20 @@ pub(crate) mod tests {
     }
 
     /// Local files with one thing changed.
+    #[derive(Default)]
     struct Twist {
         other_owner: bool,
         replace: Option<FsError>,
+        fail_set_mode: bool,
+        fail_remove: bool,
+        /// Creating the temp says something is already there.
+        tmp_exists: bool,
+        /// The next write over a non-temp file fails after truncating it.
+        fail_real_write: AtomicBool,
+        removes: AtomicU32,
+        /// stat_target fails once the replace happened.
+        lose_after_replace: bool,
+        replaced: AtomicBool,
     }
 
     impl FileSystem for Twist {
@@ -291,22 +384,129 @@ pub(crate) mod tests {
             }
             Ok(e)
         }
-        fn stat_target(&self, p: &str) -> Result<FileEntry, FsError> { LocalFs.stat_target(p) }
+        fn stat_target(&self, p: &str) -> Result<FileEntry, FsError> {
+            if self.lose_after_replace && self.replaced.load(Ordering::SeqCst) {
+                return Err(FsError::Gone("cut".into()));
+            }
+            LocalFs.stat_target(p)
+        }
         fn read(&self, p: &str, m: u64) -> Result<Vec<u8>, FsError> { LocalFs.read(p, m) }
         fn create_file(&self, p: &str) -> Result<(), FsError> { LocalFs.create_file(p) }
         fn create_dir(&self, p: &str) -> Result<(), FsError> { LocalFs.create_dir(p) }
         fn rename(&self, a: &str, b: &str) -> Result<(), FsError> { LocalFs.rename(a, b) }
-        fn remove(&self, p: &str) -> Result<(), FsError> { LocalFs.remove(p) }
+        fn remove(&self, p: &str) -> Result<(), FsError> {
+            self.removes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_remove { Err(FsError::Gone("cut".into())) } else { LocalFs.remove(p) }
+        }
         fn writable(&self) -> Result<(), String> { Ok(()) }
         fn resolve(&self, p: &str) -> Result<String, FsError> { LocalFs.resolve(p) }
-        fn write_file(&self, p: &str, b: &[u8], n: bool) -> Result<(), FsError> { LocalFs.write_file(p, b, n) }
-        fn set_mode(&self, p: &str, m: u32) -> Result<(), FsError> { LocalFs.set_mode(p, m) }
+        fn write_file(&self, p: &str, b: &[u8], n: bool, mode: Option<u32>) -> Result<(), FsError> {
+            if self.tmp_exists && p.contains(".rexa-") {
+                return Err(FsError::Exists);
+            }
+            if !p.contains(".rexa-") && !n && self.fail_real_write.swap(false, Ordering::SeqCst) {
+                LocalFs.write_file(p, &b[..b.len() / 2], false, None)?;
+                return Err(FsError::Gone("cut".into()));
+            }
+            LocalFs.write_file(p, b, n, mode)
+        }
+        fn set_mode(&self, p: &str, m: u32) -> Result<(), FsError> {
+            if self.fail_set_mode { Err(FsError::Gone("cut".into())) } else { LocalFs.set_mode(p, m) }
+        }
+        fn link_count(&self, p: &str) -> Result<Option<u64>, FsError> { LocalFs.link_count(p) }
         fn replace(&self, a: &str, b: &str) -> Result<(), FsError> {
             match &self.replace {
                 Some(e) => Err(e.clone()),
-                None => LocalFs.replace(a, b),
+                None => {
+                    LocalFs.replace(a, b)?;
+                    self.replaced.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
             }
         }
+    }
+
+    #[test]
+    fn a_left_temp_is_private_and_named() {
+        let r = root("private");
+        let p = format!("{r}/.env");
+        fs::write(&p, b"SECRET=1").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        let t = Twist { fail_set_mode: true, fail_remove: true, ..Default::default() };
+        let v = version(&t, &p);
+        let err = safe_save(&t, &p, b"SECRET=2", Some(&v)).unwrap_err();
+        let left = temps(&r);
+        assert_eq!(left.len(), 1);
+        assert_eq!(fs::metadata(format!("{r}/{}", left[0])).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(format!("{err:?}").contains(&left[0]), "{err:?}");
+        assert_eq!(fs::read(&p).unwrap(), b"SECRET=1");
+    }
+
+    #[test]
+    fn a_temp_name_taken_is_not_deleted() {
+        let r = root("taken");
+        let p = format!("{r}/f");
+        fs::write(&p, b"x").unwrap();
+        let t = Twist { tmp_exists: true, ..Default::default() };
+        let v = version(&t, &p);
+        assert!(safe_save(&t, &p, b"y", Some(&v)).is_err());
+        assert_eq!(t.removes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_failed_in_place_write_is_restored_and_says_where_the_backup_is() {
+        let r = root("inplacefail");
+        let p = format!("{r}/f");
+        fs::write(&p, b"original contents").unwrap();
+        let t = Twist { fail_real_write: AtomicBool::new(true), ..Default::default() };
+        let v = version(&t, &p);
+        let backups = std::path::PathBuf::from(format!("{r}/backups"));
+        match save_in_place(&t, &p, b"new contents here", Some(&v), &backups, "m") {
+            Err(SaveError::InPlaceFailed { restored, backup, .. }) => {
+                assert!(restored);
+                assert_eq!(fs::read(&backup).unwrap(), b"original contents");
+                assert_eq!(fs::metadata(&backup).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(fs::read(&p).unwrap(), b"original contents");
+    }
+
+    #[test]
+    fn saved_but_unverified_is_still_saved() {
+        let r = root("unverified");
+        let p = format!("{r}/f");
+        fs::write(&p, b"x").unwrap();
+        let t = Twist { lose_after_replace: true, ..Default::default() };
+        let v = version(&t, &p);
+        let s = safe_save(&t, &p, b"yy", Some(&v)).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"yy");
+        // The next save (with the file as written) sees no conflict.
+        safe_save(&LocalFs, &p, b"zz", Some(&s.version)).unwrap();
+    }
+
+    #[test]
+    fn a_new_file_never_overwrites() {
+        let r = root("newfile");
+        let p = format!("{r}/notes.md");
+        create_new(&LocalFs, &p, b"mine").unwrap();
+        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o077, 0o044 & fs::metadata(&p).unwrap().permissions().mode());
+        fs::write(&p, b"theirs").unwrap();
+        assert!(matches!(create_new(&LocalFs, &format!("{r}/notes.md"), b"again"), Err(SaveError::Changed { .. })));
+        assert_eq!(fs::read(&p).unwrap(), b"theirs");
+    }
+
+    #[test]
+    fn same_size_change_in_the_same_second_is_seen() {
+        let r = root("samesecond");
+        let p = format!("{r}/f");
+        fs::write(&p, b"aaaa").unwrap();
+        let e = LocalFs.stat_target(&p).unwrap();
+        let v = Version::read(&e, b"aaaa");
+        fs::write(&p, b"bbbb").unwrap();
+        fs::File::options().write(true).open(&p).unwrap().set_modified(e.modified.unwrap()).unwrap();
+        assert!(matches!(safe_save(&LocalFs, &p, b"cccc", Some(&v)), Err(SaveError::Changed { .. })));
+        assert_eq!(fs::read(&p).unwrap(), b"bbbb");
     }
 
     #[test]
@@ -314,7 +514,7 @@ pub(crate) mod tests {
         let r = root("owner");
         let p = format!("{r}/f");
         fs::write(&p, b"x").unwrap();
-        let t = Twist { other_owner: true, replace: None };
+        let t = Twist { other_owner: true, ..Default::default() };
         let v = version(&t, &p);
         assert_eq!(safe_save(&t, &p, b"y", Some(&v)), Err(SaveError::NeedsInPlace(InPlaceReason::OtherOwner)));
         assert_eq!(fs::read(&p).unwrap(), b"x");
@@ -326,7 +526,7 @@ pub(crate) mod tests {
         let r = root("failrep");
         let p = format!("{r}/f");
         fs::write(&p, b"x").unwrap();
-        let t = Twist { other_owner: false, replace: Some(FsError::Gone("cut".into())) };
+        let t = Twist { replace: Some(FsError::Gone("cut".into())), ..Default::default() };
         let v = version(&t, &p);
         assert_eq!(safe_save(&t, &p, b"y", Some(&v)), Err(SaveError::Fs(FsError::Gone("cut".into()))));
         assert_eq!(fs::read(&p).unwrap(), b"x");
@@ -339,7 +539,7 @@ pub(crate) mod tests {
         let p = format!("{r}/f");
         fs::write(&p, b"x").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o640)).unwrap();
-        let t = Twist { other_owner: false, replace: Some(FsError::Unsupported("no".into())) };
+        let t = Twist { replace: Some(FsError::Unsupported("no".into())), ..Default::default() };
         let v = version(&t, &p);
         let s = safe_save(&t, &p, b"y", Some(&v)).unwrap();
         assert!(s.fallback_note);

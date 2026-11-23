@@ -59,9 +59,9 @@ pub fn run(fs: &dyn FileSystem, root: &str, seed: &dyn Fn(&str, &[u8]), link: &d
 /// Writing: new files, truncating overwrites, modes, atomic replace, resolving links.
 pub fn run_write(fs: &dyn FileSystem, root: &str, seed: &dyn Fn(&str, &[u8]), link: &dyn Fn(&str, &str)) {
     let f = join(root, "w it's.txt");
-    fs.write_file(&f, b"hello world", true).unwrap();
-    assert_eq!(fs.write_file(&f, b"x", true), Err(FsError::Exists));
-    fs.write_file(&f, b"abc", false).unwrap();
+    fs.write_file(&f, b"hello world", true, None).unwrap();
+    assert_eq!(fs.write_file(&f, b"x", true, None), Err(FsError::Exists));
+    fs.write_file(&f, b"abc", false, None).unwrap();
     assert_eq!(fs.read(&f, 1 << 20).unwrap(), b"abc");
 
     fs.set_mode(&f, 0o600).unwrap();
@@ -70,7 +70,7 @@ pub fn run_write(fs: &dyn FileSystem, root: &str, seed: &dyn Fn(&str, &[u8]), li
     // Bigger than one SFTP packet.
     let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
     let b = join(root, "big.bin");
-    fs.write_file(&b, &big, true).unwrap();
+    fs.write_file(&b, &big, true, None).unwrap();
     assert_eq!(fs.read(&b, 1 << 20).unwrap(), big);
 
     seed(&join(root, "old"), b"old");
@@ -90,4 +90,13 @@ pub fn run_write(fs: &dyn FileSystem, root: &str, seed: &dyn Fn(&str, &[u8]), li
     assert_eq!(fs.resolve(&join(root, "missing")), Err(FsError::NotFound));
     let e = fs.stat(&f).unwrap();
     assert!(e.uid.is_some() && e.gid.is_some());
+
+    // A file can be created private from its first byte.
+    let p = join(root, "private");
+    fs.write_file(&p, b"secret", true, Some(0o600)).unwrap();
+    assert_eq!(fs.stat(&p).unwrap().mode.map(|m| m & 0o777), Some(0o600));
+    // Link counts, where the source knows them.
+    std::fs::hard_link(&p, join(root, "private2")).unwrap();
+    assert_eq!(fs.link_count(&p).unwrap(), Some(2));
+    assert_eq!(fs.link_count(&b).unwrap(), Some(1));
 }

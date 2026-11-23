@@ -140,7 +140,7 @@ impl FileSystem for RexFs {
     fn resolve(&self, _path: &str) -> Result<String, FsError> {
         read_only()
     }
-    fn write_file(&self, _path: &str, _bytes: &[u8], _create_new: bool) -> Result<(), FsError> {
+    fn write_file(&self, _path: &str, _bytes: &[u8], _create_new: bool, _mode: Option<u32>) -> Result<(), FsError> {
         read_only()
     }
     fn set_mode(&self, _path: &str, _mode: u32) -> Result<(), FsError> {

@@ -129,11 +129,14 @@ impl FileSystem for LocalFs {
         fs::canonicalize(path).map(|p| p.to_string_lossy().into_owned()).map_err(err)
     }
 
-    fn write_file(&self, path: &str, bytes: &[u8], create_new: bool) -> Result<(), FsError> {
+    fn write_file(&self, path: &str, bytes: &[u8], create_new: bool, mode: Option<u32>) -> Result<(), FsError> {
         let mut o = fs::OpenOptions::new();
         o.write(true);
         if create_new {
             o.create_new(true);
+            if let Some(m) = mode {
+                std::os::unix::fs::OpenOptionsExt::mode(&mut o, m & 0o7777);
+            }
         } else {
             o.create(true).truncate(true);
         }
