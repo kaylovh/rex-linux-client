@@ -6812,6 +6812,7 @@ dependencies = [
  "rex-client",
  "rex-proto",
  "rexterm",
+ "serde",
  "serde_json",
 ]
 

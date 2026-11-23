@@ -11,4 +11,5 @@ gpui-cn = { path = "../../vendor/gpui-cn", features = ["ghostty", "jetbrains-mon
 rex-proto = { path = "../rex-proto" }
 rexterm = { path = "../rexterm" }
 rex-client = { path = "../rex-client" }
+serde.workspace = true
 serde_json.workspace = true

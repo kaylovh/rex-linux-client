@@ -2,6 +2,7 @@
 //!
 //!     rexa-desktop [-S ENDPOINT] [SESSION]
 
+mod config;
 mod i18n;
 mod keys;
 mod panes;
