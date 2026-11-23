@@ -1,3 +1,4 @@
+// Changed for rexa-desktop (from gpui-cn 0.9.0, Apache-2.0): scrollback search.
 //! The terminal entity: frames in, input out.
 //!
 //! Derived from Herdr (Apache-2.0).
@@ -16,7 +17,7 @@ use gpui_kit::{
 use crate::terminal::appearance::TerminalAppearance;
 use crate::terminal::cursor::Blink;
 use crate::terminal::engine::{ExitStatus, ForegroundProcess, TerminalSnapshot, TerminalStatus};
-use crate::terminal::frame::{TerminalColors, TerminalFrame, Viewport};
+use crate::terminal::frame::{SearchFrame, SearchRequest, TerminalColors, TerminalFrame, Viewport};
 use crate::terminal::geometry::Geometry;
 use crate::terminal::input::{KeyAction, MouseAction, ScrollRequest, TerminalInput};
 use crate::terminal::keys::{self, ScrollAccumulator};
@@ -648,6 +649,29 @@ impl TerminalState {
     pub fn scroll_pages(&mut self, pages: isize, cx: &mut Context<Self>) {
         let rows = isize::try_from(self.frame.viewport.rows()).unwrap_or(24);
         self.scroll(ScrollRequest::Lines(pages.saturating_mul(rows)), cx);
+    }
+
+    /// Search the scrollback for `needle` (None or empty stops searching);
+    /// the newest match is selected and scrolled into view. Changed for
+    /// rexa-desktop.
+    pub fn search(&mut self, needle: Option<String>, cx: &mut Context<Self>) {
+        if let Some(handle) = &self.handle {
+            handle.search(SearchRequest::Set(needle));
+        }
+        cx.notify();
+    }
+
+    /// Select the next match toward older (or newer) output, wrapping.
+    pub fn search_step(&mut self, older: bool, cx: &mut Context<Self>) {
+        if let Some(handle) = &self.handle {
+            handle.search(SearchRequest::Step { older });
+        }
+        cx.notify();
+    }
+
+    /// The search as the last frame shows it.
+    pub fn search_info(&self) -> Option<&SearchFrame> {
+        self.frame.search.as_deref()
     }
 
     /// Whether the viewport is scrolled into history.

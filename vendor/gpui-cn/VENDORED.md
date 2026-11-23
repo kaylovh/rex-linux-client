@@ -12,5 +12,11 @@ Local changes (each changed file says so at its top):
   input instead of having it encoded), `ByteSink::set_grid` (a grid change in stream order), and
   the engine changes behind them.
 - `src/terminal/mod.rs`: re-exports `InputRoute`.
+- Scrollback search: `Core::search` / `search_busy` over ghostty-vt's `Search` (bounded work per
+  frame, needle kept across parking) in `core.rs`; `SearchFrame`, `SearchHighlight`,
+  `SearchRequest` and `TerminalFrame.search` in `frame.rs`; a `search` mailbox command in
+  `engine.rs` and `FrameHandle::search` in `source.rs` (never routed to the byte source);
+  `TerminalState::search`, `search_step`, `search_info` in `state.rs`; highlights drawn in
+  `element.rs`.
 - `tests/terminal_rex.rs` (new) and its `[[test]]` entry in `Cargo.toml`; the
   `resolver` line is removed from `Cargo.toml` (the workspace sets it).

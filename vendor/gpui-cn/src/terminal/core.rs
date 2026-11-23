@@ -1,4 +1,4 @@
-// Changed for rexa-desktop (from gpui-cn 0.9.0, Apache-2.0): Core::from_snapshot.
+// Changed for rexa-desktop (from gpui-cn 0.9.0, Apache-2.0): Core::from_snapshot, scrollback search.
 //! The Ghostty terminal, render state and encoders owned by one thread.
 //!
 //! `Core` turns bytes into [`TerminalFrame`]s and typed input into the bytes
@@ -26,8 +26,8 @@ use ghostty_vt::{key, mouse};
 
 use crate::terminal::frame::{
     CellSelection, CellSpan, Color, Cursor, CursorShape, ImageLayer, ImagePlacement, InputModes,
-    Rgb, ScrollMetrics, Style, StyleRun, TerminalColors, TerminalFrame, TerminalImage, TerminalRow,
-    Underline, Viewport,
+    Rgb, ScrollMetrics, SearchFrame, SearchHighlight, SearchRequest, Style, StyleRun, TerminalColors, TerminalFrame,
+    TerminalImage, TerminalRow, Underline, Viewport,
 };
 use crate::terminal::input::{
     KeyAction, Modifiers, MouseAction, MouseButton, ScrollRequest, TerminalInput,
@@ -84,7 +84,21 @@ pub(crate) struct Core {
     title: String,
     cwd: Option<PathBuf>,
     scratch: String,
+    /// The scrollback search, while one runs.
+    search: Option<CoreSearch>,
 }
+
+/// A running search: the needle, and whether the newest match still has to
+/// be selected once one is found.
+struct CoreSearch {
+    search: vt::search::Search,
+    needle: String,
+    select_pending: bool,
+}
+
+/// Search work per turn: a huge scrollback is searched over several frames
+/// instead of stalling one.
+const SEARCH_TICKS: usize = 64;
 
 /// The Kitty graphics Unicode placeholder, U+10EEEE.
 const PLACEHOLDER: char = '\u{10EEEE}';
@@ -112,6 +126,7 @@ pub(crate) struct Parked {
     cwd: Option<PathBuf>,
     revision: u64,
     content_revision: u64,
+    search: Option<String>,
 }
 
 fn fault(error: vt::Error) -> io::Error {
@@ -270,6 +285,7 @@ impl Core {
             title: String::new(),
             cwd: None,
             scratch: String::new(),
+            search: None,
         })
     }
 
@@ -290,6 +306,7 @@ impl Core {
                 cwd: self.cwd.clone(),
                 revision: self.revision,
                 content_revision: self.content_revision,
+                search: self.search.as_ref().map(|s| s.needle.clone()),
             },
         ))
     }
@@ -336,6 +353,9 @@ impl Core {
         core.revision = parked.revision;
         // The rows are rebuilt, so a selection anchored to them is too.
         core.content_revision = parked.content_revision + 1;
+        if parked.search.is_some() {
+            core.search(SearchRequest::Set(parked.search))?;
+        }
         Ok(core)
     }
 
@@ -683,10 +703,97 @@ impl Core {
     /// Build a frame when something changed, or always when `force` is set.
     ///
     /// During a render hold the frame captured when the hold began is used.
+    /// Starts, changes, steps or stops the scrollback search. A new needle
+    /// selects the newest match once one is found, scrolling it into view.
+    pub(crate) fn search(&mut self, request: SearchRequest) -> io::Result<()> {
+        match request {
+            SearchRequest::Set(needle) => match needle.filter(|n| !n.is_empty()) {
+                None => self.search = None,
+                Some(needle) => {
+                    if self.search.as_ref().is_some_and(|s| s.needle == needle) {
+                        return Ok(());
+                    }
+                    let mut search = match self.search.take() {
+                        Some(s) => s.search,
+                        None => vt::search::Search::new(&self.terminal).map_err(fault)?,
+                    };
+                    search.set_needle(&self.terminal, Some(&needle)).map_err(fault)?;
+                    self.search = Some(CoreSearch { search, needle, select_pending: true });
+                    self.search_progress()?;
+                }
+            },
+            SearchRequest::Step { older } => {
+                self.search_progress()?;
+                if let Some(s) = &mut self.search {
+                    if older {
+                        s.search.select_next(&self.terminal).map_err(fault)?;
+                    } else {
+                        s.search.select_prev(&self.terminal).map_err(fault)?;
+                    }
+                    s.select_pending = false;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the search still has scrollback to go through.
+    pub(crate) fn search_busy(&self) -> bool {
+        self.search.as_ref().is_some_and(|s| s.search.status().ok() != Some(vt::search::Status::Complete))
+    }
+
+    /// A bounded amount of search work; selects the newest match when a new
+    /// needle found one.
+    fn search_progress(&mut self) -> io::Result<()> {
+        let Some(s) = &mut self.search else { return Ok(()) };
+        s.search.feed(&self.terminal).map_err(fault)?;
+        for _ in 0..SEARCH_TICKS {
+            match s.search.tick().map_err(fault)? {
+                vt::search::Status::Running => {}
+                vt::search::Status::FeedRequired => s.search.feed(&self.terminal).map_err(fault)?,
+                vt::search::Status::Complete => break,
+            }
+        }
+        if s.select_pending && s.search.total_matches().map_err(fault)? > 0 {
+            s.search.select_next(&self.terminal).map_err(fault)?;
+            s.select_pending = false;
+        }
+        Ok(())
+    }
+
+    /// The search as the frame shows it: counts and the matches in view.
+    fn search_frame(&self) -> io::Result<Option<SearchFrame>> {
+        let Some(s) = &self.search else { return Ok(None) };
+        let terminal = &self.terminal;
+        let total = s.search.total_matches().map_err(fault)?;
+        let selected = s.search.selected_index().map_err(fault)?;
+        let current = s.search.selected_match(terminal).map_err(fault)?;
+        let columns = usize::from(self.viewport.columns());
+        let mut highlights = Vec::new();
+        for m in s.search.viewport_matches(terminal).map_err(fault)? {
+            let at = |r| terminal.point_from_grid_ref(&r, vt::terminal::PointSpace::Viewport).map_err(fault);
+            let (Some(start), Some(end)) = (at(m.start())?, at(m.end())?) else { continue };
+            let is_current = match &current {
+                Some(c) => c.equals(terminal, &m).map_err(fault)?,
+                None => false,
+            };
+            let (first, last) = (start.y as usize, end.y as usize);
+            for row in first..=last {
+                let start_col = if row == first { usize::from(start.x) } else { 0 };
+                let end_col = if row == last { usize::from(end.x) + 1 } else { columns };
+                highlights.push(SearchHighlight { row, start_col, end_col, current: is_current });
+            }
+        }
+        Ok(Some(SearchFrame { needle: s.needle.clone(), total, selected, highlights }))
+    }
+
     pub(crate) fn frame(&mut self, force: bool) -> io::Result<Option<Arc<TerminalFrame>>> {
         if self.held() {
             return Ok(None);
         }
+        // Before the render state is read: selecting a match scrolls.
+        self.search_progress()?;
+        let search = self.search_frame()?.map(Arc::new);
         let bracketed_paste = self.mode(Mode::BRACKETED_PASTE);
         let focus_reporting = self.mode(Mode::FOCUS_EVENT);
         let alternate_scroll = self.mode(Mode::ALT_SCROLL);
@@ -741,6 +848,7 @@ impl Core {
                 && f.scroll == scroll
                 && f.modes == modes
                 && f.images == images
+                && f.search == search
         });
         if !force && dirty == Dirty::Clean && unchanged_state {
             return Ok(None);
@@ -887,6 +995,7 @@ impl Core {
             colors,
             scroll,
             modes,
+            search,
         });
         self.last = Some(frame.clone());
         Ok(Some(frame))
@@ -1110,6 +1219,79 @@ pub(crate) fn key_code(name: &str) -> key::Key {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    fn sized(columns: u16, rows: u16) -> Core {
+        Core::new(Viewport::new(columns, rows, 8, 16).unwrap(), &EngineOptions::default(), TerminalColors::default()).unwrap()
+    }
+
+    fn searched(core: &mut Core) -> SearchFrame {
+        core.frame(true).unwrap().unwrap().search.as_deref().cloned().expect("a search in the frame")
+    }
+
+    #[test]
+    fn search_counts_and_highlights() {
+        let mut core = sized(20, 4);
+        core.write(b"one two\r\nthree two\r\n", &mut Effects::default());
+        core.search(SearchRequest::Set(Some("two".into()))).unwrap();
+        let s = searched(&mut core);
+        assert_eq!(s.total, 2);
+        assert_eq!(s.selected, Some(0));
+        let mut h: Vec<_> = s.highlights.iter().map(|h| (h.row, h.start_col, h.end_col, h.current)).collect();
+        h.sort();
+        assert_eq!(h, vec![(0, 4, 7, false), (1, 6, 9, true)]);
+    }
+
+    #[test]
+    fn search_reaches_scrollback() {
+        let mut core = sized(20, 4);
+        let mut text = String::new();
+        for i in 0..50 {
+            text.push_str(&format!("line {i}\r\n"));
+        }
+        core.write(text.as_bytes(), &mut Effects::default());
+        core.search(SearchRequest::Set(Some("line 3".into()))).unwrap();
+        let frame = core.frame(true).unwrap().unwrap();
+        let s = frame.search.as_deref().unwrap();
+        assert_eq!(s.total, 11);
+        assert_eq!(s.selected, Some(0));
+        assert!(s.highlights.iter().any(|h| h.current), "the selected match is in view: {:?}", s.highlights);
+        assert!(!frame.scroll.at_bottom(), "scrolled into the scrollback");
+    }
+
+    #[test]
+    fn search_step_wraps() {
+        let mut core = sized(20, 4);
+        core.write(b"one two\r\nthree two\r\n", &mut Effects::default());
+        core.search(SearchRequest::Set(Some("two".into()))).unwrap();
+        assert_eq!(searched(&mut core).selected, Some(0));
+        core.search(SearchRequest::Step { older: true }).unwrap();
+        assert_eq!(searched(&mut core).selected, Some(1));
+        core.search(SearchRequest::Step { older: true }).unwrap();
+        assert_eq!(searched(&mut core).selected, Some(0));
+        core.search(SearchRequest::Step { older: false }).unwrap();
+        assert_eq!(searched(&mut core).selected, Some(1));
+    }
+
+    #[test]
+    fn search_clear_removes_highlights() {
+        let mut core = sized(20, 4);
+        core.write(b"one two\r\n", &mut Effects::default());
+        core.search(SearchRequest::Set(Some("two".into()))).unwrap();
+        assert_eq!(searched(&mut core).total, 1);
+        core.search(SearchRequest::Set(None)).unwrap();
+        assert!(core.frame(true).unwrap().unwrap().search.is_none());
+    }
+
+    #[test]
+    fn search_follows_new_output() {
+        let mut core = sized(20, 4);
+        core.write(b"one two\r\n", &mut Effects::default());
+        core.search(SearchRequest::Set(Some("two".into()))).unwrap();
+        assert_eq!(searched(&mut core).total, 1);
+        core.write(b"x two\r\n", &mut Effects::default());
+        assert_eq!(searched(&mut core).total, 2);
+    }
 
     fn core() -> Core {
         Core::new(

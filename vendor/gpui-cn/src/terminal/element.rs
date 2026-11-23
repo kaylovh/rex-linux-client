@@ -1,3 +1,4 @@
+// Changed for rexa-desktop (from gpui-cn 0.9.0, Apache-2.0): search highlights.
 //! The terminal element: one canvas that paints the grid.
 //!
 //! Everything the paint phase needs is built during prepaint so painting
@@ -217,6 +218,8 @@ impl RenderOnce for Terminal {
 struct Painting {
     backgrounds: Vec<(Bounds<Pixels>, Hsla)>,
     selections: Vec<Bounds<Pixels>>,
+    /// Search matches in view, and whether each is the selected one.
+    search_marks: Vec<(Bounds<Pixels>, bool)>,
     blocks: Vec<(Bounds<Pixels>, Hsla)>,
     decorations: Vec<(Bounds<Pixels>, Hsla)>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
@@ -496,6 +499,15 @@ fn prepare(
     };
     let mut drawn = HashMap::with_capacity(usize::from(geometry.rows));
     let visible = usize::from(geometry.rows).min(frame.rows.len());
+    if let Some(search) = &frame.search {
+        for h in search.highlights.iter().filter(|h| h.row < visible && h.start_col < h.end_col) {
+            let columns = usize::from(geometry.columns);
+            #[allow(clippy::cast_possible_truncation)]
+            let span = (h.start_col.min(columns) as u16)..(h.end_col.min(columns) as u16);
+            #[allow(clippy::cast_possible_truncation)]
+            painting.search_marks.push((geometry.span_bounds(span, h.row as u16), h.current));
+        }
+    }
     for (index, row) in frame.rows.iter().take(visible).enumerate() {
         #[allow(clippy::cast_possible_truncation)]
         let row_index = index as u16;
@@ -833,6 +845,10 @@ fn paint(painting: Painting, window: &mut Window, cx: &mut App) {
     }
     for bounds in painting.selections {
         window.paint_quad(fill(bounds, painting.selection));
+    }
+    for (bounds, current) in painting.search_marks {
+        let color = if current { gpui_kit::hsla(0.08, 0.95, 0.55, 0.6) } else { gpui_kit::hsla(0.14, 0.9, 0.5, 0.28) };
+        window.paint_quad(fill(bounds, color));
     }
     images(ImageLayer::BelowText, window);
     for (bounds, color) in painting.decorations {

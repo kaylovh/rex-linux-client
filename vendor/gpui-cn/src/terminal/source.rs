@@ -1,3 +1,4 @@
+// Changed for rexa-desktop (from gpui-cn 0.9.0, Apache-2.0): scrollback search.
 //! Where a terminal's frames come from.
 //!
 //! A [`FrameSource`] produces [`TerminalSnapshot`]s into a [`FrameSink`] and
@@ -12,7 +13,7 @@ use gpui_kit::base::async_util;
 
 use crate::terminal::core::{Core, Effects};
 use crate::terminal::engine::{InputRejected, TerminalSnapshot};
-use crate::terminal::frame::{CellSelection, CursorShape, TerminalColors, Viewport};
+use crate::terminal::frame::{CellSelection, CursorShape, SearchRequest, TerminalColors, Viewport};
 use crate::terminal::input::TerminalInput;
 use crate::terminal::options::EngineOptions;
 
@@ -176,6 +177,11 @@ pub trait FrameHandle: 'static {
     fn copy(&self, selection: CellSelection) -> Option<async_util::Receiver<io::Result<String>>> {
         let _ = selection;
         None
+    }
+    /// Start, change, step or stop the scrollback search (engines that
+    /// keep a terminal; others ignore it). Changed for rexa-desktop.
+    fn search(&self, request: SearchRequest) {
+        let _ = request;
     }
     /// Stop the source. Idempotent.
     fn close(&self);

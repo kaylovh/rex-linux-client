@@ -1,4 +1,4 @@
-// Changed for rexa-desktop (from gpui-cn 0.9.0, Apache-2.0): ByteHandle::route_input/InputRoute, ByteSink::set_grid, and engine support for snapshot starts and source-sized grids.
+// Changed for rexa-desktop (from gpui-cn 0.9.0, Apache-2.0): ByteHandle::route_input/InputRoute, ByteSink::set_grid, and engine support for snapshot starts and source-sized grids, scrollback search.
 //! The owner thread: one thread per terminal that owns the Ghostty state,
 //! parses output, encodes input and publishes frames.
 //!
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::base::async_util;
 
 use crate::terminal::core::{Core, Effects};
-use crate::terminal::frame::{CellSelection, CursorShape, TerminalColors, TerminalFrame, Viewport};
+use crate::terminal::frame::{CellSelection, CursorShape, SearchRequest, TerminalColors, TerminalFrame, Viewport};
 use crate::terminal::input::TerminalInput;
 use crate::terminal::options::EngineOptions;
 use crate::terminal::source::{FrameHandle, FrameSink, FrameSource, StartOptions};
@@ -452,6 +452,8 @@ struct Mailbox {
     cursor: Option<(CursorShape, bool)>,
     colors: Option<TerminalColors>,
     generation: u64,
+    /// Scrollback search requests, in order.
+    search: Vec<SearchRequest>,
 }
 
 #[derive(Debug)]
@@ -529,6 +531,14 @@ impl EngineHandle {
     #[must_use]
     pub fn input_backlog(&self) -> usize {
         self.shared.lock().bytes
+    }
+
+    /// Start, change, step or stop the scrollback search. It stays in the
+    /// engine: the byte source never sees it.
+    pub fn search(&self, request: SearchRequest) {
+        let mut mail = self.shared.lock();
+        mail.search.push(request);
+        self.shared.bump(&mut mail);
     }
 
     /// Change the grid.
@@ -739,6 +749,10 @@ impl FrameHandle for EngineHandle {
         Self::input_backlog(self)
     }
 
+    fn search(&self, request: SearchRequest) {
+        Self::search(self, request);
+    }
+
     fn resize(&self, viewport: Viewport) {
         Self::resize(self, viewport);
     }
@@ -919,6 +933,7 @@ impl Owner {
             colors,
             painted,
             generation,
+            searches,
         ) = {
             let mut mail = self.shared.lock();
             let interrupt = mail.interrupt.take();
@@ -946,6 +961,7 @@ impl Owner {
                 mail.colors.take(),
                 std::mem::take(&mut mail.painted),
                 mail.generation,
+                std::mem::take(&mut mail.search),
             )
         };
         let had_work = !reads.is_empty()
@@ -955,7 +971,8 @@ impl Owner {
             || interrupt.is_some()
             || copy.is_some()
             || cursor.is_some()
-            || colors.is_some();
+            || colors.is_some()
+            || !searches.is_empty();
         {
             // Anything that needs the terminal restores a parked one first;
             // with nothing to do, a parked terminal only waits.
@@ -1058,6 +1075,11 @@ impl Owner {
                 self.dirty = true;
             }
         }
+        for request in searches {
+            self.core.search(request)?;
+            self.dirty = true;
+            self.force = true;
+        }
         if let Some((selection, reply)) = copy {
             let _ = reply.try_send(self.core.copy(selection));
         }
@@ -1103,7 +1125,8 @@ impl Owner {
                 self.shared.lock().credit = false;
                 self.publish();
             }
-            self.dirty = false;
+            // A search over a long scrollback goes on in the next frames.
+            self.dirty = self.core.search_busy();
             self.force = false;
         }
         if self

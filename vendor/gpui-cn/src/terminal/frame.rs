@@ -1,3 +1,4 @@
+// Changed for rexa-desktop (from gpui-cn 0.9.0, Apache-2.0): scrollback search.
 //! Immutable frames the engine publishes to the UI.
 //!
 //! A frame is everything a renderer needs to draw one viewport: the rows as
@@ -578,6 +579,47 @@ pub struct TerminalFrame {
     pub scroll: ScrollMetrics,
     /// The input modes.
     pub modes: InputModes,
+    /// The running scrollback search, if any.
+    pub search: Option<Arc<SearchFrame>>,
+}
+
+/// What the engine's search shows: the match count, the selected match and
+/// the matches in view. Changed for rexa-desktop.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchFrame {
+    /// The text searched for.
+    pub needle: String,
+    /// Matches in the whole screen, scrollback included.
+    pub total: usize,
+    /// The selected match, 0 being the newest.
+    pub selected: Option<usize>,
+    /// The parts of matches in the viewport, one per row they cover.
+    pub highlights: Vec<SearchHighlight>,
+}
+
+/// One row's part of a match, in viewport cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchHighlight {
+    /// Viewport row.
+    pub row: usize,
+    /// First column.
+    pub start_col: usize,
+    /// Exclusive.
+    pub end_col: usize,
+    /// Part of the selected match.
+    pub current: bool,
+}
+
+/// A request to the engine's search.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchRequest {
+    /// Search for this text (None or empty: stop searching).
+    Set(Option<String>),
+    /// Select the next match toward older (or newer) output, wrapping.
+    Step {
+        /// Toward older output.
+        older: bool,
+    },
 }
 
 impl TerminalFrame {
@@ -599,6 +641,7 @@ impl TerminalFrame {
             colors: TerminalColors::default(),
             scroll: ScrollMetrics::new(count, 0, count),
             modes: InputModes::default(),
+            search: None,
         }
     }
 
