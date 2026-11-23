@@ -40,11 +40,12 @@ pub fn session_name(id: &str, label: &str) -> String {
 
 pub fn palette_entries(sessions: &[PaletteSession], machines: &[(&str, &str)], has_session: bool) -> Vec<PaletteEntry> {
     use Command::*;
-    let commands: [(Command, &str, &str, Option<&str>, bool); 11] = [
+    let commands: [(Command, &str, &str, Option<&str>, bool); 12] = [
         (NewTab, "New tab", "新建 tab", Some("c"), true),
         (SplitRight, "Split right", "向右分屏", Some("%"), true),
         (SplitDown, "Split down", "向下分屏", Some("\""), true),
         (Zoom, "Zoom pane", "放大 pane", Some("z"), true),
+        (Search, "Search scrollback", "搜索回滚内容", Some("/"), true),
         (ClosePane, "Close pane", "关闭 pane", Some("x"), true),
         (RenameTab, "Rename tab", "重命名 tab", Some(","), true),
         (RenameSession, "Rename session", "重命名 session", Some("$"), true),
@@ -102,6 +103,7 @@ mod tests {
         assert!(has(PaletteAction::NewSession("local".into())));
         let e = palette_entries(&[], &[("local", "This computer")], true);
         assert!(e.iter().any(|x| x.action == PaletteAction::Run(Command::SplitRight) && x.hint.as_deref() == Some("Ctrl-b %")));
+        assert!(e.iter().any(|x| x.action == PaletteAction::Run(Command::Search) && x.hint.as_deref() == Some("Ctrl-b /")));
     }
 
     #[test]

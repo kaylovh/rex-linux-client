@@ -122,6 +122,8 @@ enum Modal {
     Palette,
     Rename { machine: String, session: String, input: Entity<InputState>, _sub: Subscription },
     Settings { view: Entity<SettingsView>, _sub: Subscription },
+    /// The search bar over one pane.
+    Search { block: String, input: Entity<InputState>, _sub: Subscription },
 }
 
 /// Where to go once a machine connects. `machine` None: the first machine that connects.
@@ -630,6 +632,11 @@ impl Workspace {
 
     fn reconcile_panes(&mut self, wanted: &[String], window: &mut Window, cx: &mut Context<Self>) {
         let (add, remove) = diff(&self.panes.blocks(), wanted);
+        if let Modal::Search { block, .. } = &self.modal
+            && remove.contains(block)
+        {
+            self.modal = Modal::None;
+        }
         for b in remove {
             if let Some(e) = self.panes.entries.remove(&b)
                 && let Some(term) = e.terminal
@@ -896,6 +903,7 @@ impl Workspace {
                 );
             }
             Command::Palette | Command::Settings => {}
+            Command::Search => self.open_search(window, cx),
             Command::ToggleSidebar => {
                 self.sidebar.update(cx, |s, cx| s.toggle(cx));
                 self.save_state(window, cx);
@@ -950,6 +958,10 @@ impl Workspace {
         // A dialog takes every key: typing a name must not start commands.
         if !matches!(self.modal, Modal::None) {
             self.prefix = false;
+            if matches!(self.modal, Modal::Search { .. }) && ev.keystroke.key == "escape" {
+                self.close_search(window, cx);
+                cx.stop_propagation();
+            }
             return;
         }
         let ks = &ev.keystroke;
@@ -1064,6 +1076,79 @@ impl Workspace {
         cx.notify();
     }
 
+    fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(block) = self.focused_block.clone() else { return };
+        let Some(term) = self.panes.terminal(&block).cloned() else { return };
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(t("Search", "搜索")));
+        let sub = cx.subscribe_in(&input, window, move |_, input, ev: &InputEvent, _, cx| match ev {
+            InputEvent::Change => {
+                let text = input.read(cx).value().to_string();
+                term.update(cx, |t, cx| t.search((!text.is_empty()).then_some(text), cx));
+            }
+            // Enter: older matches (up the scrollback); Shift-Enter: newer.
+            InputEvent::PressEnter { shift, .. } => term.update(cx, |t, cx| t.search_step(!shift, cx)),
+            InputEvent::Blur | InputEvent::Focus => {}
+        });
+        input.update(cx, |i, cx| i.focus(window, cx));
+        if let Modal::Search { .. } = self.modal {
+            self.close_search(window, cx);
+        }
+        self.modal = Modal::Search { block, input, _sub: sub };
+        cx.notify();
+    }
+
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Modal::Search { block, .. } = std::mem::replace(&mut self.modal, Modal::None) else { return };
+        if let Some(term) = self.panes.terminal(&block) {
+            term.update(cx, |t, cx| t.search(None, cx));
+        }
+        self.focus_terminal(window, cx);
+        cx.notify();
+    }
+
+    /// The search bar for the pane it belongs to.
+    fn search_bar(&self, block: &str, cx: &mut Context<Self>) -> Option<Div> {
+        let Modal::Search { block: b, input, .. } = &self.modal else { return None };
+        if b != block {
+            return None;
+        }
+        let info = self.panes.terminal(block).and_then(|t| t.read(cx).search_info().cloned());
+        let count = match &info {
+            Some(s) if s.total > 0 => format!("{}/{}", s.selected.map_or(0, |i| i + 1), s.total),
+            Some(_) => t("no matches", "没有匹配").to_string(),
+            None => String::new(),
+        };
+        let step = |id: &'static str, label: &'static str, older: bool, cx: &mut Context<Self>| {
+            let block = block.to_string();
+            Button::new(id).ghost().label(label).on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(term) = this.panes.terminal(&block).cloned() {
+                    term.update(cx, |t, cx| t.search_step(older, cx));
+                }
+            }))
+        };
+        Some(
+            div()
+                .absolute()
+                .top(px(4.))
+                .right(px(12.))
+                .w(px(380.))
+                .flex()
+                .items_center()
+                .gap_1()
+                .p_1()
+                .bg(rgb(0x2b2b2b))
+                .border_1()
+                .border_color(rgb(0x4a4a4a))
+                .rounded_md()
+                .occlude()
+                .child(div().flex_1().child(Input::new(input)))
+                .child(div().w(px(80.)).text_sm().text_color(rgb(0xb0b0b0)).child(count))
+                .child(step("search-older", "↑", true, cx))
+                .child(step("search-newer", "↓", false, cx))
+                .child(Button::new("search-close").ghost().label("✕").on_click(cx.listener(|this, _, window, cx| this.close_search(window, cx)))),
+        )
+    }
+
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pinned = self.machines.first().is_some_and(|m| m.spec.key == "cli");
         let settings = self.settings.clone();
@@ -1166,7 +1251,7 @@ impl Workspace {
     fn render_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let this = cx.weak_entity();
         match &self.modal {
-            Modal::None => None,
+            Modal::None | Modal::Search { .. } => None,
             Modal::Palette => Some(
                 CommandDialog::new("palette", &self.palette)
                     .open(true)
@@ -1294,6 +1379,9 @@ impl Workspace {
         match (p.terminal, self.panes.terminal(&p.block_id)) {
             (true, Some(term)) => {
                 let mut c = cell.child(Terminal::new(SharedString::from(format!("t-{}", p.block_id)), term));
+                if let Some(bar) = self.search_bar(&p.block_id, cx) {
+                    c = c.child(bar);
+                }
                 if let Some(text) = self.panes.status(&p.block_id).text() {
                     c = c.child(div().absolute().bottom_0().left_0().right_0().px_2().bg(rgb(0x3a3a3a)).text_sm().text_color(rgb(0xe0e0e0)).child(text));
                 }

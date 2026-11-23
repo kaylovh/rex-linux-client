@@ -33,6 +33,7 @@ pub enum Command {
     Palette,
     Settings,
     CloseSession,
+    Search,
 }
 
 /// The command for `key` (a GPUI key name such as "c", "%", "left", "b") pressed after the
@@ -72,6 +73,7 @@ pub fn prefix_command(key: &str, shift: bool, ctrl: bool) -> Option<Command> {
         "N" => NewSession,
         "$" => RenameSession,
         ":" => Palette,
+        "/" => Search,
         "s" => ToggleSidebar,
         "d" => Quit,
         k if k.len() == 1 && ("1"..="9").contains(&k) => Tab(k.as_bytes()[0] - b'1'),
@@ -112,6 +114,7 @@ mod tests {
         assert_eq!(prefix_command("N", false, false), Some(NewSession));
         assert_eq!(prefix_command("b", false, true), Some(SendPrefix));
         assert_eq!(k(":"), Some(Palette));
+        assert_eq!(k("/"), Some(Search));
         assert_eq!(prefix_command(";", true, false), Some(Palette));
     }
 
