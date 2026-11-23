@@ -242,6 +242,11 @@ impl Workspace {
                 this.save_state(window, cx);
                 cx.notify();
             }
+            PreviewEvent::AllSaved => {
+                // Saved for a quit: go on.
+                this.save_state(window, cx);
+                cx.quit();
+            }
             PreviewEvent::Saved => {
                 // A new file shows up in its folder.
                 this.files.update(cx, |f, cx| f.refresh(cx));
@@ -541,6 +546,40 @@ impl Workspace {
         if let Some(k) = self.shown.clone() {
             self.open(k, sid, window, cx);
         }
+    }
+
+    /// Whether the window can close now; with unsaved files, asks Save all / Discard / Cancel
+    /// first and says no (the answer finishes the close).
+    pub fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let names = self.preview.read(cx).dirty_names();
+        if names.is_empty() {
+            self.save_state(window, cx);
+            return true;
+        }
+        let detail = crate::preview::unsaved_summary(&names);
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            t("Some files have unsaved changes.", "有文件的修改尚未保存。"),
+            Some(&detail),
+            &[
+                PromptButton::Ok(t("Save all", "全部保存").into()),
+                PromptButton::Other(t("Discard", "不保存").into()),
+                PromptButton::Cancel(t("Cancel", "取消").into()),
+            ],
+            cx,
+        );
+        self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+            let choice = answer.await;
+            let _ = this.update_in(cx, |this, window, cx| match choice {
+                Ok(0) => this.preview.update(cx, |p, cx| p.save_all_then_quit(window, cx)),
+                Ok(1) => {
+                    this.save_state(window, cx);
+                    cx.quit();
+                }
+                _ => {}
+            });
+        }));
+        false
     }
 
     /// Writes which machine and session are shown, the sidebar and the window size.
@@ -1081,8 +1120,9 @@ impl Workspace {
                 self.save_state(window, cx);
             }
             Command::Quit => {
-                self.save_state(window, cx);
-                cx.quit();
+                if self.request_close(window, cx) {
+                    cx.quit();
+                }
             }
             Command::SendPrefix => {
                 if let Some(b) = focused {

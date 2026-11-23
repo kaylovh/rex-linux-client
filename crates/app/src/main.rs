@@ -121,10 +121,8 @@ fn main() {
             gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, Some(window), cx);
             let ws = cx.new(|cx| workspace::Workspace::new(init, window, cx));
             let w2 = ws.clone();
-            window.on_window_should_close(cx, move |window, cx| {
-                w2.read(cx).save_state(window, cx);
-                true
-            });
+            // Unsaved files are asked about first; the answer finishes the close.
+            window.on_window_should_close(cx, move |window, cx| w2.update(cx, |w, cx| w.request_close(window, cx)));
             ws
         })
         .expect("failed to open window");

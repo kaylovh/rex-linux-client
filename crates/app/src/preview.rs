@@ -149,7 +149,17 @@ struct Tab {
     content: Content,
 }
 
+/// What happens once the pending saves are done.
+#[derive(Clone, PartialEq)]
+enum AfterSave {
+    Nothing,
+    Close(String, Option<String>, String),
+    Quit,
+}
+
 pub enum PreviewEvent {
+    /// Every unsaved file was saved for a quit: go on quitting.
+    AllSaved,
     /// A tab was closed (the list of open files changed).
     Closed,
     /// A file was saved (its folder may show it now).
@@ -160,13 +170,14 @@ pub enum PreviewEvent {
 pub struct PreviewPanel {
     tabs: Vec<Tab>,
     active: usize,
+    after_save: AfterSave,
 }
 
 impl EventEmitter<PreviewEvent> for PreviewPanel {}
 
 impl PreviewPanel {
     pub fn new() -> Self {
-        PreviewPanel { tabs: Vec::new(), active: 0 }
+        PreviewPanel { tabs: Vec::new(), active: 0, after_save: AfterSave::Nothing }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -267,6 +278,64 @@ impl PreviewPanel {
         self.tabs.iter().position(|t| t.machine == machine && &t.source == source && t.path == path)
     }
 
+    fn is_dirty(&self, i: usize) -> bool {
+        self.tabs.get(i).is_some_and(|t| matches!(&t.content, Content::Text(x) if x.dirty || (t.new_file && x.editing)))
+    }
+
+    /// The names of the files with unsaved changes.
+    pub fn dirty_names(&self) -> Vec<String> {
+        (0..self.tabs.len()).filter(|i| self.is_dirty(*i)).map(|i| self.tabs[i].name.clone()).collect()
+    }
+
+    /// Saves every unsaved file, then reports AllSaved (a failed or questioned save stops it).
+    pub fn save_all_then_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dirty: Vec<usize> = (0..self.tabs.len()).filter(|i| self.is_dirty(*i)).collect();
+        if dirty.is_empty() {
+            cx.emit(PreviewEvent::AllSaved);
+            return;
+        }
+        self.after_save = AfterSave::Quit;
+        for i in dirty {
+            self.save(i, false, window, cx);
+        }
+    }
+
+    /// Closes tab `i`, asking first when it has unsaved changes.
+    fn request_close(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_dirty(i) {
+            self.close(i, cx);
+            return;
+        }
+        let tab = &self.tabs[i];
+        let key = (tab.machine.clone(), tab.source.clone(), tab.path.clone());
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            t_("Save changes before closing?", "关闭前保存修改吗?"),
+            Some(&tab.name),
+            &[
+                PromptButton::Ok(t_("Save", "保存").into()),
+                PromptButton::Other(t_("Discard", "不保存").into()),
+                PromptButton::Cancel(t_("Cancel", "取消").into()),
+            ],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let choice = answer.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let Some(i) = this.find(&key.0, &key.1, &key.2) else { return };
+                match choice {
+                    Ok(0) => {
+                        this.after_save = AfterSave::Close(key.0, key.1, key.2);
+                        this.save(i, false, window, cx);
+                    }
+                    Ok(1) => this.close(i, cx),
+                    _ => {}
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Whether the editor of the shown tab has the keyboard.
     pub fn editor_focused(&self, window: &Window, cx: &App) -> bool {
         match self.tabs.get(self.active).map(|t| &t.content) {
@@ -325,6 +394,10 @@ impl PreviewPanel {
         if let Some(t) = self.text_mut(i) {
             t.saving = false;
         }
+        // Anything but a clean save stops a pending close or quit: the user decides again.
+        if result.is_err() {
+            self.after_save = AfterSave::Nothing;
+        }
         match result {
             Ok(s) => {
                 let tab = &mut self.tabs[i];
@@ -336,6 +409,19 @@ impl PreviewPanel {
                     t.message = s.fallback_note.then(|| t_("Saved by deleting and renaming: the server can't rename over a file.", "已通过删除再改名保存:服务器不支持直接改名覆盖。").into());
                 }
                 cx.emit(PreviewEvent::Saved);
+                match self.after_save.clone() {
+                    AfterSave::Close(m, s, p) if m == machine && &s == source && p == path => {
+                        self.after_save = AfterSave::Nothing;
+                        if let Some(i) = self.find(&m, &s, &p) {
+                            self.close(i, cx);
+                        }
+                    }
+                    AfterSave::Quit if self.dirty_names().is_empty() => {
+                        self.after_save = AfterSave::Nothing;
+                        cx.emit(PreviewEvent::AllSaved);
+                    }
+                    _ => {}
+                }
             }
             Err(SaveError::Changed { .. }) => {
                 let answer = window.prompt(
@@ -498,6 +584,12 @@ fn text_tab(
     TextTab { editor, note, block, editing: false, dirty: false, base, eol, saved: lf, saving: false, message: None, _sub: sub }
 }
 
+/// The unsaved files for a prompt: up to five names, then how many more.
+pub fn unsaved_summary(names: &[String]) -> String {
+    let shown = names.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+    if names.len() > 5 { format!("{shown} (+{})", names.len() - 5) } else { shown }
+}
+
 pub fn human_size(n: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut v = n as f64;
@@ -536,9 +628,9 @@ impl Render for PreviewPanel {
                             .text_color(rgb(0x8a8a8a))
                             .hover(|s| s.text_color(rgb(0xe0e0e0)))
                             .child("×")
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.close(i, cx);
+                                this.request_close(i, window, cx);
                             })),
                     ),
             );
@@ -631,6 +723,15 @@ mod tests {
         assert!(edit_block_reason(None, 100, true).unwrap().contains("Rex"));
         assert!(edit_block_reason(Some("local"), EDIT_MAX + 1, true).unwrap().contains("2 MB"));
         assert!(edit_block_reason(Some("local"), 100, false).unwrap().contains("UTF-8"));
+    }
+
+    #[test]
+    fn unsaved_summary_lists_names() {
+        assert_eq!(unsaved_summary(&["a.txt".into()]), "a.txt");
+        assert_eq!(unsaved_summary(&["a".into(), "b".into(), "c".into()]), "a, b, c");
+        let many: Vec<String> = (1..=7).map(|i| format!("f{i}")).collect();
+        assert!(unsaved_summary(&many).starts_with("f1, f2, f3, f4, f5"));
+        assert!(unsaved_summary(&many).contains('2'));
     }
 
     #[test]
