@@ -115,27 +115,8 @@ impl Endpoint {
                 hop = &rest[i + 1..];
                 rest = rest[..i].trim_end_matches('/');
             }
-            if rest.is_empty() {
-                return Err(ParseError(s.into()));
-            }
-            let control_path = runtime_dir().join("rexa-desktop-%C");
-            let mut argv: Vec<String> = [
-                "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
-                "-o", "ControlMaster=auto", "-o",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-            argv.push(format!("ControlPath={}", control_path.display()));
-            argv.extend(["-o".to_string(), "ControlPersist=60".to_string()]);
-            if let Some(i) = rest.rfind(':') {
-                let port = &rest[i + 1..];
-                if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
-                    argv.extend(["-p".to_string(), port.to_string()]);
-                    rest = &rest[..i];
-                }
-            }
-            argv.push(rest.to_string());
+            let (mut argv, host) = ssh_argv(rest).ok_or_else(|| ParseError(s.into()))?;
+            argv.push(host);
             argv.push(if hop.is_empty() {
                 format!("{REMOTE_PATH}exec rex __internal dial-stdio")
             } else {
@@ -267,9 +248,60 @@ impl Read for ChildReader {
     }
 }
 
+/// The ssh options for `[user@]host[:port]` (one shared ControlMaster connection per machine)
+/// and the host to name, or None for an empty host.
+fn ssh_argv(rest: &str) -> Option<(Vec<String>, String)> {
+    let mut rest = rest;
+    if rest.is_empty() {
+        return None;
+    }
+    let control_path = runtime_dir().join("rexa-desktop-%C");
+    let mut argv: Vec<String> = [
+        "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
+        "-o", "ControlMaster=auto", "-o",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    argv.push(format!("ControlPath={}", control_path.display()));
+    argv.extend(["-o".to_string(), "ControlPersist=60".to_string()]);
+    if let Some(i) = rest.rfind(':') {
+        let port = &rest[i + 1..];
+        if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+            argv.extend(["-p".to_string(), port.to_string()]);
+            rest = &rest[..i];
+        }
+    }
+    Some((argv, rest.to_string()))
+}
+
+/// The command that starts SFTP on an ssh machine over its shared connection, or None for
+/// an address that isn't a direct ssh machine (a hop through Rex, a socket, a label).
+pub fn sftp_command(address: &str) -> Option<Vec<String>> {
+    let rest = address.strip_prefix("ssh://")?.trim_end_matches('/');
+    if rest.contains('#') {
+        return None;
+    }
+    let (mut argv, host) = ssh_argv(rest)?;
+    argv.extend(["-s".to_string(), host, "sftp".to_string()]);
+    Some(argv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sftp_command_for_ssh() {
+        let argv = sftp_command("ssh://me@dev:2222").unwrap();
+        assert_eq!(argv[0], "ssh");
+        assert!(argv.windows(2).any(|w| w == ["-p", "2222"]));
+        assert!(argv.iter().any(|a| a.starts_with("ControlPath=")));
+        assert_eq!(&argv[argv.len() - 3..], ["-s", "me@dev", "sftp"]);
+        assert_eq!(sftp_command("ssh://me@dev#studio"), None);
+        assert_eq!(sftp_command("unix:///tmp/x.sock"), None);
+        assert_eq!(sftp_command("ssh://"), None);
+    }
     use std::time::Instant;
 
     fn argv(ep: &Endpoint) -> &[String] {
