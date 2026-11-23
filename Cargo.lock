@@ -6845,6 +6845,7 @@ dependencies = [
  "rexterm",
  "serde",
  "serde_json",
+ "ttf-parser",
 ]
 
 [[package]]

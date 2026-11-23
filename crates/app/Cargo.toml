@@ -21,3 +21,6 @@ rex-client = { path = "../rex-client" }
 files = { path = "../files" }
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+ttf-parser = "0.25"
