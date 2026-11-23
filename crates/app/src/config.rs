@@ -116,6 +116,19 @@ pub fn config_dir(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     })
 }
 
+/// Where in-place saves keep the old contents: the user's cache folder, rexa-desktop/backups.
+pub fn backup_dir(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let nonempty = |k: &str| get(k).filter(|v| !v.is_empty());
+    let cache = match nonempty("XDG_CACHE_HOME") {
+        Some(c) => PathBuf::from(c),
+        None => {
+            let home = PathBuf::from(nonempty("HOME")?);
+            if cfg!(target_os = "macos") { home.join("Library/Caches") } else { home.join(".cache") }
+        }
+    };
+    Some(cache.join("rexa-desktop/backups"))
+}
+
 /// The settings, or the defaults with the reason when the file can't be used. A missing file
 /// is not a problem.
 pub fn load_settings(dir: &Path) -> (Settings, Option<String>) {
@@ -254,6 +267,17 @@ mod tests {
         let d = tmp("badstate");
         fs::write(d.join("state.json"), "nonsense").unwrap();
         assert_eq!(load_state(&d), WorkspaceState::default());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backup_dir_in_the_cache() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        assert_eq!(backup_dir(env(&[("XDG_CACHE_HOME", "/c"), ("HOME", "/h")])), Some(PathBuf::from("/c/rexa-desktop/backups")));
+        assert_eq!(backup_dir(env(&[("HOME", "/h")])), Some(PathBuf::from("/h/.cache/rexa-desktop/backups")));
+        assert_eq!(backup_dir(env(&[])), None);
     }
 
     #[cfg(target_os = "linux")]

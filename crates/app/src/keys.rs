@@ -45,6 +45,14 @@ pub fn gui_command(ks: &Keystroke) -> Option<Command> {
     None
 }
 
+/// Save in an editor: Ctrl-S (Cmd-S on macOS). Only while an editor has the keyboard; in a
+/// terminal Ctrl-S belongs to the program.
+pub fn is_save(ks: &Keystroke) -> bool {
+    let m = &ks.modifiers;
+    let main = if cfg!(target_os = "macos") { m.platform && !m.control } else { m.control && !m.platform };
+    main && !m.shift && !m.alt && ks.key == "s"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,6 +80,19 @@ mod tests {
         assert_eq!(cmd("ctrl-pageup"), Some(Command::PrevTab));
         assert_eq!(cmd("alt-left"), Some(Command::Focus(Dir::Left)));
         assert_eq!(cmd("alt-down"), Some(Command::Focus(Dir::Down)));
+    }
+
+    #[test]
+    fn save_key() {
+        let k = |s: &str| {
+            let s: &'static str = s.to_string().leak();
+            is_save(&Keystroke::parse(s).unwrap())
+        };
+        let main = if cfg!(target_os = "macos") { "cmd-s" } else { "ctrl-s" };
+        assert!(k(main));
+        assert!(!k("s"));
+        assert!(!k("ctrl-shift-s"));
+        assert!(!k("alt-s"));
     }
 
     #[test]

@@ -242,6 +242,11 @@ impl Workspace {
                 this.save_state(window, cx);
                 cx.notify();
             }
+            PreviewEvent::Saved => {
+                // A new file shows up in its folder.
+                this.files.update(cx, |f, cx| f.refresh(cx));
+                this.save_state(window, cx);
+            }
         })
         .detach();
         let files_state = init.state.files.clone();
@@ -963,6 +968,10 @@ impl Workspace {
 
     fn run(&mut self, cmd: Command, window: &mut Window, cx: &mut Context<Self>) {
         match cmd {
+            Command::Save => {
+                self.preview.update(cx, |p, cx| p.save_active(window, cx));
+                return;
+            }
             Command::ToggleFiles => {
                 self.files_open = !self.files_open;
                 self.last_follow = None;
@@ -1066,7 +1075,7 @@ impl Workspace {
             }
             Command::Palette | Command::Settings => {}
             Command::Search => self.open_search(window, cx),
-            Command::ServerInfo | Command::ToggleFiles => {}
+            Command::ServerInfo | Command::ToggleFiles | Command::Save => {}
             Command::ToggleSidebar => {
                 self.sidebar.update(cx, |s, cx| s.toggle(cx));
                 self.save_state(window, cx);
@@ -1123,6 +1132,15 @@ impl Workspace {
             Modal::Search { input, .. } => Some(input.read(cx).focus_handle(cx).is_focused(window)),
             _ => None,
         };
+        // Editing a file: keys are the editor's, except Save.
+        if self.preview.read(cx).editor_focused(window, cx) {
+            self.prefix = false;
+            if crate::keys::is_save(&ev.keystroke) {
+                self.preview.update(cx, |p, cx| p.save_active(window, cx));
+                cx.stop_propagation();
+            }
+            return;
+        }
         // Typing in the file panel: keys are its own (Escape closes its name field).
         if self.files.read(cx).typing(window, cx) {
             self.prefix = false;
@@ -1483,6 +1501,13 @@ impl Workspace {
     fn on_files_event(&mut self, _: &Entity<FilePanel>, ev: &PanelEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
             PanelEvent::OpenFile { path } => self.open_preview(path.clone(), window, cx),
+            PanelEvent::NewFile { path } => {
+                let panel = self.files.read(cx);
+                let (Some(machine), Some(fs)) = (panel.machine().map(str::to_string), panel.fs()) else { return };
+                let tag = self.files_source.as_ref().and_then(source_tag);
+                self.preview.update(cx, |p, cx| p.open_new(machine, tag, path.clone(), fs, window, cx));
+                cx.notify();
+            }
             PanelEvent::Retry => {
                 self.last_follow = None;
                 let pinned = self.files.read(cx).pinned();

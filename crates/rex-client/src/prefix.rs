@@ -36,6 +36,8 @@ pub enum Command {
     Search,
     ServerInfo,
     ToggleFiles,
+    /// Save the file being edited (not a prefix key).
+    Save,
 }
 
 /// The command for `key` (a GPUI key name such as "c", "%", "left", "b") pressed after the

@@ -63,6 +63,8 @@ pub fn lookup<'a>(children: &'a HashMap<String, Vec<FileEntry>>, path: &str) -> 
 /// What the panel asks the workspace for.
 pub enum PanelEvent {
     OpenFile { path: String },
+    /// Open an empty editor for a file to create on its first save.
+    NewFile { path: String },
     /// Refresh with nothing to refresh (the connection failed): find the place again.
     Retry,
     CdHere { path: String },
@@ -400,7 +402,22 @@ impl FilePanel {
         let (op_dir, op): (String, Box<dyn FnOnce() -> Result<(), FsError> + Send>) = match kind {
             Prompt::NewFile => {
                 let p = join(&dir, &name);
-                (dir, Box::new(move || fs.create_file(&p)))
+                // Something already there is refused now, not at the first save.
+                let check = fs.clone();
+                let path = p.clone();
+                cx.spawn(async move |this, cx| {
+                    let there = cx.background_spawn(async move { check.stat(&path) }).await;
+                    let _ = this.update(cx, |this, cx| {
+                        match there {
+                            Err(FsError::NotFound) => cx.emit(PanelEvent::NewFile { path: p }),
+                            Ok(_) => this.message = Some(fs_error_text(&FsError::Exists)),
+                            Err(e) => this.message = Some(fs_error_text(&e)),
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+                return;
             }
             Prompt::NewDir => {
                 let p = join(&dir, &name);
