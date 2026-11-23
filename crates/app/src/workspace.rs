@@ -642,6 +642,8 @@ impl Workspace {
             Command::NewSession => self.new_session(window, cx),
             // Renaming sessions comes with the M2b palette/settings work.
             Command::RenameSession => {}
+            // Wired with the dialogs.
+            Command::Palette | Command::Settings | Command::CloseSession => {}
             Command::ToggleSidebar => self.sidebar.update(cx, |s, cx| s.toggle(cx)),
             Command::Quit => cx.quit(),
             Command::SendPrefix => {

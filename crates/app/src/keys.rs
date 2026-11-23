@@ -19,6 +19,8 @@ pub fn gui_command(ks: &Keystroke) -> Option<Command> {
             "e" => Command::SplitDown,
             "b" => Command::ToggleSidebar,
             "enter" => Command::Zoom,
+            "p" => Command::Palette,
+            "," => Command::Settings,
             _ => return None,
         });
     }
@@ -59,6 +61,9 @@ mod tests {
         assert_eq!(cmd(&format!("{main}e")), Some(Command::SplitDown));
         assert_eq!(cmd(&format!("{main}b")), Some(Command::ToggleSidebar));
         assert_eq!(cmd(&format!("{main}enter")), Some(Command::Zoom));
+        assert_eq!(cmd(&format!("{main}p")), Some(Command::Palette));
+        let settings = if cfg!(target_os = "macos") { "cmd-," } else { "ctrl-shift-," };
+        assert_eq!(cmd(settings), Some(Command::Settings));
         assert_eq!(cmd("ctrl-pagedown"), Some(Command::NextTab));
         assert_eq!(cmd("ctrl-pageup"), Some(Command::PrevTab));
         assert_eq!(cmd("alt-left"), Some(Command::Focus(Dir::Left)));

@@ -5,6 +5,7 @@
 mod config;
 mod i18n;
 mod keys;
+mod machines;
 mod panes;
 mod workspace;
 
