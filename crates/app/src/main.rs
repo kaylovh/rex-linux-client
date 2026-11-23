@@ -9,6 +9,7 @@ mod fonts;
 mod hosts;
 mod i18n;
 mod keys;
+mod locate;
 mod machines;
 mod palette;
 mod panes;
