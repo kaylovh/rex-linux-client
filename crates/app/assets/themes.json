@@ -1,0 +1,338 @@
+[
+ {
+  "name": "One Dark",
+  "dark": true,
+  "ui": {
+   "background": "#282c34",
+   "panel": "#21252b",
+   "elevated": "#2c313a",
+   "hover": "#2c313a",
+   "selected": "#3e4451",
+   "border": "#181a1f",
+   "text": "#abb2bf",
+   "muted": "#7f848e",
+   "accent": "#61afef",
+   "warning": "#e5c07b",
+   "error": "#e06c75",
+   "success": "#98c379"
+  },
+  "terminal": {
+   "background": "#282c34",
+   "foreground": "#abb2bf",
+   "cursor": "#528bff",
+   "selection": "#3e4451",
+   "palette": [
+    "#282c34",
+    "#e06c75",
+    "#98c379",
+    "#e5c07b",
+    "#61afef",
+    "#c678dd",
+    "#56b6c2",
+    "#abb2bf",
+    "#5c6370",
+    "#e06c75",
+    "#98c379",
+    "#e5c07b",
+    "#61afef",
+    "#c678dd",
+    "#56b6c2",
+    "#ffffff"
+   ]
+  }
+ },
+ {
+  "name": "Dracula",
+  "dark": true,
+  "ui": {
+   "background": "#282a36",
+   "panel": "#21222c",
+   "elevated": "#343746",
+   "hover": "#343746",
+   "selected": "#44475a",
+   "border": "#191a21",
+   "text": "#f8f8f2",
+   "muted": "#8b93c4",
+   "accent": "#bd93f9",
+   "warning": "#f1fa8c",
+   "error": "#ff5555",
+   "success": "#50fa7b"
+  },
+  "terminal": {
+   "background": "#282a36",
+   "foreground": "#f8f8f2",
+   "cursor": "#f8f8f2",
+   "selection": "#44475a",
+   "palette": [
+    "#21222c",
+    "#ff5555",
+    "#50fa7b",
+    "#f1fa8c",
+    "#bd93f9",
+    "#ff79c6",
+    "#8be9fd",
+    "#f8f8f2",
+    "#6272a4",
+    "#ff6e6e",
+    "#69ff94",
+    "#ffffa5",
+    "#d6acff",
+    "#ff92df",
+    "#a4ffff",
+    "#ffffff"
+   ]
+  }
+ },
+ {
+  "name": "Catppuccin Mocha",
+  "dark": true,
+  "ui": {
+   "background": "#1e1e2e",
+   "panel": "#181825",
+   "elevated": "#313244",
+   "hover": "#313244",
+   "selected": "#45475a",
+   "border": "#11111b",
+   "text": "#cdd6f4",
+   "muted": "#a6adc8",
+   "accent": "#89b4fa",
+   "warning": "#f9e2af",
+   "error": "#f38ba8",
+   "success": "#a6e3a1"
+  },
+  "terminal": {
+   "background": "#1e1e2e",
+   "foreground": "#cdd6f4",
+   "cursor": "#f5e0dc",
+   "selection": "#585b70",
+   "palette": [
+    "#45475a",
+    "#f38ba8",
+    "#a6e3a1",
+    "#f9e2af",
+    "#89b4fa",
+    "#f5c2e7",
+    "#94e2d5",
+    "#bac2de",
+    "#585b70",
+    "#f38ba8",
+    "#a6e3a1",
+    "#f9e2af",
+    "#89b4fa",
+    "#f5c2e7",
+    "#94e2d5",
+    "#a6adc8"
+   ]
+  }
+ },
+ {
+  "name": "Tokyo Night",
+  "dark": true,
+  "ui": {
+   "background": "#1a1b26",
+   "panel": "#16161e",
+   "elevated": "#24283b",
+   "hover": "#292e42",
+   "selected": "#283457",
+   "border": "#101014",
+   "text": "#c0caf5",
+   "muted": "#737aa2",
+   "accent": "#7aa2f7",
+   "warning": "#e0af68",
+   "error": "#f7768e",
+   "success": "#9ece6a"
+  },
+  "terminal": {
+   "background": "#1a1b26",
+   "foreground": "#c0caf5",
+   "cursor": "#c0caf5",
+   "selection": "#283457",
+   "palette": [
+    "#15161e",
+    "#f7768e",
+    "#9ece6a",
+    "#e0af68",
+    "#7aa2f7",
+    "#bb9af7",
+    "#7dcfff",
+    "#a9b1d6",
+    "#414868",
+    "#f7768e",
+    "#9ece6a",
+    "#e0af68",
+    "#7aa2f7",
+    "#bb9af7",
+    "#7dcfff",
+    "#c0caf5"
+   ]
+  }
+ },
+ {
+  "name": "Gruvbox Dark",
+  "dark": true,
+  "ui": {
+   "background": "#282828",
+   "panel": "#1d2021",
+   "elevated": "#32302f",
+   "hover": "#3c3836",
+   "selected": "#504945",
+   "border": "#141617",
+   "text": "#ebdbb2",
+   "muted": "#a89984",
+   "accent": "#83a598",
+   "warning": "#fabd2f",
+   "error": "#fb4934",
+   "success": "#b8bb26"
+  },
+  "terminal": {
+   "background": "#282828",
+   "foreground": "#ebdbb2",
+   "cursor": "#ebdbb2",
+   "selection": "#504945",
+   "palette": [
+    "#282828",
+    "#cc241d",
+    "#98971a",
+    "#d79921",
+    "#458588",
+    "#b16286",
+    "#689d6a",
+    "#a89984",
+    "#928374",
+    "#fb4934",
+    "#b8bb26",
+    "#fabd2f",
+    "#83a598",
+    "#d3869b",
+    "#8ec07c",
+    "#ebdbb2"
+   ]
+  }
+ },
+ {
+  "name": "Nord",
+  "dark": true,
+  "ui": {
+   "background": "#2e3440",
+   "panel": "#242933",
+   "elevated": "#3b4252",
+   "hover": "#3b4252",
+   "selected": "#434c5e",
+   "border": "#1f232b",
+   "text": "#d8dee9",
+   "muted": "#8891a4",
+   "accent": "#88c0d0",
+   "warning": "#ebcb8b",
+   "error": "#bf616a",
+   "success": "#a3be8c"
+  },
+  "terminal": {
+   "background": "#2e3440",
+   "foreground": "#d8dee9",
+   "cursor": "#d8dee9",
+   "selection": "#434c5e",
+   "palette": [
+    "#3b4252",
+    "#bf616a",
+    "#a3be8c",
+    "#ebcb8b",
+    "#81a1c1",
+    "#b48ead",
+    "#88c0d0",
+    "#e5e9f0",
+    "#4c566a",
+    "#bf616a",
+    "#a3be8c",
+    "#ebcb8b",
+    "#81a1c1",
+    "#b48ead",
+    "#8fbcbb",
+    "#eceff4"
+   ]
+  }
+ },
+ {
+  "name": "GitHub Light",
+  "dark": false,
+  "ui": {
+   "background": "#ffffff",
+   "panel": "#f6f8fa",
+   "elevated": "#ffffff",
+   "hover": "#eaeef2",
+   "selected": "#ddf4ff",
+   "border": "#d0d7de",
+   "text": "#1f2328",
+   "muted": "#656d76",
+   "accent": "#0969da",
+   "warning": "#9a6700",
+   "error": "#cf222e",
+   "success": "#1a7f37"
+  },
+  "terminal": {
+   "background": "#ffffff",
+   "foreground": "#1f2328",
+   "cursor": "#0969da",
+   "selection": "#b6e3ff",
+   "palette": [
+    "#24292f",
+    "#cf222e",
+    "#116329",
+    "#4d2d00",
+    "#0969da",
+    "#8250df",
+    "#1b7c83",
+    "#6e7781",
+    "#57606a",
+    "#a40e26",
+    "#1a7f37",
+    "#633c01",
+    "#218bff",
+    "#a475f9",
+    "#3192aa",
+    "#8c959f"
+   ]
+  }
+ },
+ {
+  "name": "Solarized Light",
+  "dark": false,
+  "ui": {
+   "background": "#fdf6e3",
+   "panel": "#eee8d5",
+   "elevated": "#fdf6e3",
+   "hover": "#e6dfca",
+   "selected": "#dcd5bf",
+   "border": "#d3cbb7",
+   "text": "#586e75",
+   "muted": "#839496",
+   "accent": "#268bd2",
+   "warning": "#b58900",
+   "error": "#dc322f",
+   "success": "#859900"
+  },
+  "terminal": {
+   "background": "#fdf6e3",
+   "foreground": "#586e75",
+   "cursor": "#586e75",
+   "selection": "#eee8d5",
+   "palette": [
+    "#073642",
+    "#dc322f",
+    "#859900",
+    "#b58900",
+    "#268bd2",
+    "#d33682",
+    "#2aa198",
+    "#eee8d5",
+    "#002b36",
+    "#cb4b16",
+    "#586e75",
+    "#657b83",
+    "#839496",
+    "#6c71c4",
+    "#93a1a1",
+    "#fdf6e3"
+   ]
+  }
+ }
+]

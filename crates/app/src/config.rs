@@ -50,6 +50,10 @@ pub struct Settings {
     pub shown_hosts: Vec<ShownHosts>,
     /// Where downloads go; None: ~/Downloads.
     pub download_dir: Option<String>,
+    /// The theme's name; None: the default.
+    pub theme: Option<String>,
+    /// A PNG or SVG for the app icon; None: rexa's.
+    pub icon: Option<String>,
 }
 
 /// A preview left open: the machine, the path, and how it was read ("local" or
@@ -211,6 +215,8 @@ mod tests {
             font: FontSettings { family: Some("Iosevka".into()), size: Some(15.0), fallbacks: vec!["Noto Color Emoji".into()] },
             shown_hosts: vec![ShownHosts { server: "local".into(), hosts: vec!["studio".into()] }],
             download_dir: Some("/data/in".into()),
+            theme: Some("Nord".into()),
+            icon: Some("/home/me/icon.png".into()),
         };
         save_settings(&d, &s, false).unwrap();
         assert_eq!(load_settings(&d), (s, None));

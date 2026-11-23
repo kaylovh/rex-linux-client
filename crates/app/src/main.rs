@@ -17,6 +17,7 @@ mod preview;
 mod panes;
 mod server_info;
 mod settings_view;
+mod theme;
 mod transfers;
 mod workspace;
 

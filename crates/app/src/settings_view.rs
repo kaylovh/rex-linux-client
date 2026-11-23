@@ -71,6 +71,8 @@ pub struct SettingsView {
     host_groups: Vec<HostGroup>,
     shown_hosts: Vec<ShownHosts>,
     downloads: Entity<InputState>,
+    theme: Option<String>,
+    icon: Option<String>,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -101,6 +103,8 @@ impl SettingsView {
             host_groups,
             shown_hosts: settings.shown_hosts.clone(),
             downloads: input(settings.download_dir.clone().unwrap_or_default(), "~/Downloads", window, cx),
+            theme: settings.theme.clone(),
+            icon: settings.icon.clone(),
         }
     }
 
@@ -144,7 +148,7 @@ impl SettingsView {
         let read = |e: &Entity<InputState>, cx: &Context<Self>| e.read(cx).value().to_string();
         match parse_font(&read(&self.family, cx), &read(&self.size, cx), &read(&self.fallbacks, cx)) {
             Ok(font) => {
-                let s = Settings { language: self.language, machines: self.machines.clone(), font, shown_hosts: self.shown_hosts.clone(), download_dir: self.download_value(cx) };
+                let s = Settings { language: self.language, machines: self.machines.clone(), font, shown_hosts: self.shown_hosts.clone(), download_dir: self.download_value(cx), theme: self.theme.clone(), icon: self.icon.clone() };
                 self.error = None;
                 cx.emit(SettingsEvent::Save(s));
             }
