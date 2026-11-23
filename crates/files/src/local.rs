@@ -69,6 +69,18 @@ impl FileSystem for LocalFs {
         entry(name_of(path), Path::new(path))
     }
 
+    fn stat_target(&self, path: &str) -> Result<FileEntry, FsError> {
+        let meta = fs::metadata(path).map_err(err)?;
+        let kind = if meta.is_dir() {
+            Kind::Dir
+        } else if meta.is_file() {
+            Kind::File
+        } else {
+            Kind::Other
+        };
+        Ok(FileEntry { name: name_of(path), kind, size: Some(meta.len()), modified: meta.modified().ok(), mode: Some(meta.permissions().mode()) })
+    }
+
     fn read(&self, path: &str, max: u64) -> Result<Vec<u8>, FsError> {
         let mut out = Vec::new();
         fs::File::open(path).map_err(err)?.take(max).read_to_end(&mut out).map_err(err)?;

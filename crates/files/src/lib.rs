@@ -78,6 +78,8 @@ pub trait FileSystem: Send + Sync {
     fn list(&self, path: &str) -> Result<Listing, FsError>;
     /// The entry itself (a link is not followed).
     fn stat(&self, path: &str) -> Result<FileEntry, FsError>;
+    /// What the path leads to, links followed: Other for pipes, devices and sockets.
+    fn stat_target(&self, path: &str) -> Result<FileEntry, FsError>;
     /// At most `max` bytes from the start of a file.
     fn read(&self, path: &str, max: u64) -> Result<Vec<u8>, FsError>;
     /// A new empty file; Exists if anything is there.

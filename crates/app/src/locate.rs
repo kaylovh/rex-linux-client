@@ -44,6 +44,21 @@ pub fn source_for_machine(machine: &MachineSpec, machine_host: Option<&str>, loc
     }
 }
 
+/// How a file was read, for remembering it: this computer, or an ssh machine's address.
+/// None for files read through Rex (they need a terminal to come back).
+pub fn source_tag(s: &Source) -> Option<String> {
+    match s {
+        Source::Local => Some("local".into()),
+        Source::Sftp { address } => Some(format!("sftp:{address}")),
+        _ => None,
+    }
+}
+
+/// Whether a file remembered with `tag` is the same file where `now` reads.
+pub fn restorable(tag: &str, now: &Source) -> bool {
+    source_tag(now).as_deref() == Some(tag)
+}
+
 /// One shell word: single quotes, with ' written as '\''.
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -98,6 +113,18 @@ mod tests {
         assert_eq!(source_for_machine(&m("cli", "unix:///run/t.sock", false), Some("L"), Some("L")), Source::Local);
         assert!(matches!(source_for_machine(&m("h:local/studio", "studio.ts.net", false), Some("S"), Some("L")), Source::Unavailable(_)));
         assert!(matches!(source_for_machine(&m("cli", "unix:///run/t.sock", false), None, Some("L")), Source::Unavailable(_)));
+    }
+
+    #[test]
+    fn previews_restore_only_from_the_same_source() {
+        assert_eq!(source_tag(&Source::Local), Some("local".to_string()));
+        assert_eq!(source_tag(&Source::Sftp { address: "ssh://me@dev".into() }), Some("sftp:ssh://me@dev".into()));
+        assert_eq!(source_tag(&rex("m:dev")), None);
+        assert_eq!(source_tag(&Source::Unavailable("x".into())), None);
+        assert!(restorable("local", &Source::Local));
+        assert!(!restorable("local", &Source::Sftp { address: "ssh://me@dev".into() }));
+        assert!(restorable("sftp:ssh://me@dev", &Source::Sftp { address: "ssh://me@dev".into() }));
+        assert!(!restorable("sftp:ssh://me@dev", &Source::Sftp { address: "ssh://other".into() }));
     }
 
     #[test]

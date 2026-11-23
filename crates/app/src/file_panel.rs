@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use files::{FileEntry, FileSystem, FsError, Listing, join, parent};
+use files::{FileEntry, FileSystem, FsError, Kind, Listing, join, parent};
 use gpui_cn::{Button, ButtonSize, Input};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::input::{InputEvent, InputState};
@@ -53,9 +53,18 @@ pub fn rows_for_tree(root: &str, children: &HashMap<String, Vec<FileEntry>>, exp
     out
 }
 
+/// The entry at `path` from its folder's last listing, shown or not.
+pub fn lookup<'a>(children: &'a HashMap<String, Vec<FileEntry>>, path: &str) -> Option<&'a FileEntry> {
+    let dir = parent(path)?;
+    let name = path.trim_end_matches('/').rsplit('/').next()?;
+    children.get(&dir)?.iter().find(|e| e.name == name)
+}
+
 /// What the panel asks the workspace for.
 pub enum PanelEvent {
     OpenFile { path: String },
+    /// Refresh with nothing to refresh (the connection failed): find the place again.
+    Retry,
     CdHere { path: String },
     PickMachine(String),
     Follow,
@@ -93,6 +102,8 @@ pub struct FilePanel {
     generation: u64,
     /// The path field shows the new top folder on the next render.
     sync_path_input: bool,
+    /// The folder last asked for (refreshed when its listing failed).
+    wanted: Option<String>,
     _subs: Vec<Subscription>,
 }
 
@@ -142,6 +153,7 @@ impl FilePanel {
             machines: Vec::new(),
             generation: 0,
             sync_path_input: false,
+            wanted: None,
             _subs: vec![sub],
         }
     }
@@ -225,6 +237,7 @@ impl FilePanel {
 
     /// Lists `dir` (None: home) and shows it as the top of the tree.
     pub fn go(&mut self, dir: Option<String>, cx: &mut Context<Self>) {
+        self.wanted = dir.clone();
         let Some(fs) = self.fs.clone() else { return };
         self.generation += 1;
         let generation = self.generation;
@@ -301,7 +314,14 @@ impl FilePanel {
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        let Some(root) = self.root.clone() else { return };
+        if self.fs.is_none() {
+            cx.emit(PanelEvent::Retry);
+            return;
+        }
+        let Some(root) = self.root.clone() else {
+            self.go(self.wanted.clone(), cx);
+            return;
+        };
         self.load(root, cx);
         for d in self.expanded.clone() {
             self.load(d, cx);
@@ -417,9 +437,15 @@ impl FilePanel {
 
     fn delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(path), Some(fs)) = (self.selected.clone(), self.fs.clone()) else { return };
-        let is_dir = self.rows().iter().any(|r| r.path == path && r.dir);
+        // From the listing, not the rows: the folder may be hidden or collapsed now.
+        let is_dir = lookup(&self.children, &path).is_none_or(|e| e.kind == Kind::Dir);
         let detail = if is_dir {
-            format!("{path}\n{}", t("The folder and everything in it will be deleted.", "文件夹及其中的所有内容都会被删除。"))
+            let count = self.children.get(&path).map(|c| format!(" ({} {})", c.len(), t("items", "项")));
+            format!(
+                "{path}\n{}{}",
+                t("The folder and everything in it will be deleted.", "文件夹及其中的所有内容都会被删除。"),
+                count.unwrap_or_default()
+            )
         } else {
             path.clone()
         };
@@ -461,7 +487,7 @@ impl FilePanel {
                     this.go(Some(p), cx);
                 }
             })))
-            .child(tool("files-refresh", IconName::RefreshCw, t("Refresh", "刷新"), self.fs.is_some()).on_click(cx.listener(|this, _, _, cx| this.refresh(cx))))
+            .child(tool("files-refresh", IconName::RefreshCw, t("Refresh", "刷新"), self.machine.is_some()).on_click(cx.listener(|this, _, _, cx| this.refresh(cx))))
             .child(
                 tool("files-hidden", if self.show_hidden { IconName::Eye } else { IconName::EyeOff }, t("Show hidden files", "显示隐藏文件"), true)
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -639,7 +665,6 @@ impl Render for FilePanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use files::Kind;
 
     fn e(name: &str, kind: Kind) -> FileEntry {
         FileEntry { name: name.into(), kind, size: None, modified: None, mode: None }
@@ -651,6 +676,17 @@ mod tests {
         let names = |v: Vec<FileEntry>| v.into_iter().map(|e| e.name).collect::<Vec<_>>();
         assert_eq!(names(sort_entries(&list, false)), ["Alpha", "beta", "zlink", "a.txt", "b.txt"]);
         assert_eq!(names(sort_entries(&list, true)), ["Alpha", "beta", "zlink", ".env", "a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn lookup_finds_hidden_and_collapsed_entries() {
+        let mut children = HashMap::new();
+        children.insert("/r".to_string(), vec![e(".config", Kind::Dir), e("a", Kind::File)]);
+        children.insert("/r/.config".to_string(), vec![e("x", Kind::File), e("y", Kind::File)]);
+        assert_eq!(lookup(&children, "/r/.config").map(|e| e.kind), Some(Kind::Dir));
+        assert_eq!(lookup(&children, "/r/a").map(|e| e.kind), Some(Kind::File));
+        assert_eq!(lookup(&children, "/r/zzz"), None);
+        assert_eq!(children.get("/r/.config").map(Vec::len), Some(2));
     }
 
     #[test]

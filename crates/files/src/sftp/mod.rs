@@ -347,6 +347,11 @@ impl FileSystem for SftpFs {
         })
     }
 
+    fn stat_target(&self, path: &str) -> Result<FileEntry, FsError> {
+        // STAT follows links and never opens the file (a pipe can't block it).
+        self.with(|c| c.attrs(wire::STAT, path).map(|a| entry(name_of(path), &a)))
+    }
+
     fn read(&self, path: &str, max: u64) -> Result<Vec<u8>, FsError> {
         self.with(|c| {
             let h = c.handle(wire::OPEN, |o| o.str(path).u32(wire::READ_FLAG).attrs(&Attrs::default()))?;

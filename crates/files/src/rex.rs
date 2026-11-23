@@ -96,6 +96,16 @@ impl FileSystem for RexFs {
         v["entries"].as_array().into_iter().flatten().filter_map(entry).find(|e| e.name == name).ok_or(FsError::NotFound)
     }
 
+    fn stat_target(&self, path: &str) -> Result<FileEntry, FsError> {
+        // Rex marks anything that isn't a folder as a file; download_begin refuses
+        // anything that isn't a regular file, so nothing can block there.
+        let mut e = self.stat(path)?;
+        if let Kind::Symlink { to_dir } = e.kind {
+            e.kind = if to_dir { Kind::Dir } else { Kind::File };
+        }
+        Ok(e)
+    }
+
     fn read(&self, path: &str, max: u64) -> Result<Vec<u8>, FsError> {
         let v = self.call("com.superlogical.terminal.download_begin", json!({"ref": download_ref(), "path": path}))?;
         let ticket = v["ticket"].as_str().ok_or_else(|| FsError::Other("no download ticket".into()))?;

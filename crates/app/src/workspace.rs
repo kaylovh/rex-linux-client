@@ -32,7 +32,7 @@ use crate::machines::{ConnState, MachineSpec, StartChoice, after_reconnect, star
 use crate::palette::{PaletteAction, PaletteEntry, PaletteSession, palette_entries, session_name};
 use crate::file_panel::{FilePanel, PanelEvent};
 use crate::preview::{PreviewEvent, PreviewPanel};
-use crate::locate::{Source, cd_command, source_for_block, source_for_machine};
+use crate::locate::{Source, cd_command, restorable, source_for_block, source_for_machine, source_tag};
 use crate::machines::machine_specs;
 use crate::panes::{PaneEntry, PaneSet, PaneStatus, diff};
 use crate::settings_view::{HostGroup, SettingsEvent, SettingsView, terminal_config};
@@ -199,7 +199,9 @@ pub struct Workspace {
     files_open: bool,
     /// Restored once their machine connects: the pinned folder, the open previews.
     pending_pin: Option<(String, String)>,
-    pending_previews: Vec<(String, String)>,
+    pending_previews: Vec<crate::config::SavedPreview>,
+    /// Bumped by every file panel location change: a slow connect for an older one is dropped.
+    files_seq: u64,
     /// The pin being restored, saved as is until the panel shows it.
     pin_target: Option<(String, String)>,
     preview: Entity<PreviewPanel>,
@@ -287,6 +289,7 @@ impl Workspace {
             pending_pin: files_state.pinned,
             pending_previews: init.state.previews.clone(),
             pin_target: None,
+            files_seq: 0,
             preview,
             last_follow: None,
             files_source: None,
@@ -498,6 +501,8 @@ impl Workspace {
         self.active_window = None;
         self.focused_block = None;
         self.fetching_view = false;
+        // The next session's terminals get the file panel anew (their connection may be new).
+        self.last_follow = None;
     }
 
     /// Attaches `sid` on the shown machine and shows it (the caller has left the old one).
@@ -901,6 +906,8 @@ impl Workspace {
                         .detach();
                     }
                     if shown {
+                        // A file panel reading through the old connection gets the new one.
+                        self.last_follow = None;
                         self.recover_all(window, cx);
                     }
                 }
@@ -1429,6 +1436,8 @@ impl Workspace {
 
     fn show_files(&mut self, key: String, name: String, source: Source, dir: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.files_source = Some(source.clone());
+        self.files_seq += 1;
+        let seq = self.files_seq;
         let ready: Option<Result<Arc<dyn files::FileSystem>, String>> = match &source {
             Source::Local => Some(Ok(self.local_fs.clone())),
             Source::Sftp { address } => self.sftp.get(address).cloned().map(Ok),
@@ -1461,6 +1470,10 @@ impl Workspace {
                     this.sftp.insert(address.clone(), fs.clone());
                     fs
                 });
+                // The panel moved on while this connected: keep the connection, not the place.
+                if this.files_seq != seq {
+                    return;
+                }
                 this.files.update(cx, |f, cx| f.set_location(key, name, fs, dir, cx));
             });
         }));
@@ -1469,6 +1482,14 @@ impl Workspace {
     fn on_files_event(&mut self, _: &Entity<FilePanel>, ev: &PanelEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
             PanelEvent::OpenFile { path } => self.open_preview(path.clone(), window, cx),
+            PanelEvent::Retry => {
+                self.last_follow = None;
+                let pinned = self.files.read(cx).pinned();
+                match self.files.read(cx).machine().map(str::to_string) {
+                    Some(key) if pinned => self.on_files_event(&self.files.clone(), &PanelEvent::PickMachine(key), window, cx),
+                    _ => self.follow(window, cx),
+                }
+            }
             PanelEvent::CdHere { path } => {
                 let here = self.focused_source(cx).map(|(_, _, s, _)| s);
                 let same = match (&here, &self.files_source) {
@@ -1511,7 +1532,8 @@ impl Workspace {
     fn open_preview(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         let panel = self.files.read(cx);
         let (Some(machine), Some(fs)) = (panel.machine().map(str::to_string), panel.fs()) else { return };
-        self.preview.update(cx, |p, cx| p.open(machine, path, fs, window, cx));
+        let tag = self.files_source.as_ref().and_then(source_tag);
+        self.preview.update(cx, |p, cx| p.open(machine, tag, path, fs, window, cx));
         self.save_state(window, cx);
         cx.notify();
     }
@@ -1529,13 +1551,18 @@ impl Workspace {
             self.files.update(cx, |f, cx| f.set_pinned(true, cx));
             self.show_files(key.to_string(), name, source.clone(), Some(dir), window, cx);
         }
-        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_previews).into_iter().partition(|(m, _)| m == key);
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_previews).into_iter().partition(|p| p.machine == key);
         self.pending_previews = rest;
-        for (_, path) in mine {
+        for saved in mine {
+            // Read the same way as before, or not at all (another host behind the same server).
+            if !restorable(&saved.source, &source) {
+                continue;
+            }
+            let (path, tag) = (saved.path, Some(saved.source));
             match &source {
                 Source::Local => {
                     let fs = self.local_fs.clone();
-                    self.preview.update(cx, |p, cx| p.open(key.to_string(), path, fs, window, cx));
+                    self.preview.update(cx, |p, cx| p.open(key.to_string(), tag, path, fs, window, cx));
                 }
                 Source::Sftp { address } => {
                     let (address, key) = (address.clone(), key.to_string());
@@ -1555,7 +1582,7 @@ impl Workspace {
                         let _ = this.update_in(cx, |this, window, cx| {
                             if let Ok(fs) = fs {
                                 this.sftp.entry(address).or_insert_with(|| fs.clone());
-                                this.preview.update(cx, |p, cx| p.open(key, path, fs, window, cx));
+                                this.preview.update(cx, |p, cx| p.open(key, tag, path, fs, window, cx));
                             }
                         });
                     }));

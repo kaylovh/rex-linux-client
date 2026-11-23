@@ -42,6 +42,14 @@ pub fn run(fs: &dyn FileSystem, root: &str, seed: &dyn Fn(&str, &[u8]), link: &d
     fs.remove(&sub).unwrap();
     assert_eq!(fs.stat(&sub), Err(FsError::NotFound));
 
+    // What a path is once links are followed; a FIFO is not a file to read.
+    assert_eq!(fs.stat_target(&join(root, "hello.txt")).map(|e| e.kind), Ok(Kind::File));
+    let fifo = join(root, "pipe");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    assert_eq!(fs.stat_target(&fifo).map(|e| e.kind), Ok(Kind::Other));
+    link(&join(root, "hello.txt"), &join(root, "to-hello"));
+    assert_eq!(fs.stat_target(&join(root, "to-hello")).map(|e| e.kind), Ok(Kind::File));
+
     assert_eq!(fs.list(&join(root, "nope")), Err(FsError::NotFound));
     assert_eq!(fs.list(&join(root, "hello.txt")), Err(FsError::NotDir));
     assert!(fs.home().unwrap().starts_with('/'));

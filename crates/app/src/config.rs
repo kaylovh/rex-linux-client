@@ -50,6 +50,15 @@ pub struct Settings {
     pub shown_hosts: Vec<ShownHosts>,
 }
 
+/// A preview left open: the machine, the path, and how it was read ("local" or
+/// "sftp:<address>").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedPreview {
+    pub machine: String,
+    pub path: String,
+    pub source: String,
+}
+
 /// The file panel as it was left.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -69,8 +78,7 @@ pub struct WorkspaceState {
     pub sidebar_width: Option<f32>,
     pub window_size: Option<(f32, f32)>,
     pub files: FilesState,
-    /// Open previews as (machine key, path).
-    pub previews: Vec<(String, String)>,
+    pub previews: Vec<SavedPreview>,
 }
 
 impl Default for FontSettings {
@@ -231,7 +239,7 @@ mod tests {
         let d = tmp("filesstate");
         let s = WorkspaceState {
             files: FilesState { open: true, pinned: Some(("m:dev".into(), "/srv/app".into())), show_hidden: true },
-            previews: vec![("local".into(), "/etc/hosts".into())],
+            previews: vec![SavedPreview { machine: "local".into(), path: "/etc/hosts".into(), source: "local".into() }],
             ..Default::default()
         };
         save_state(&d, &s).unwrap();

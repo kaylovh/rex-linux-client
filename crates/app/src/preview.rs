@@ -10,6 +10,7 @@ use gpui_kit::{
     Render, SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div, img, px, rgb,
 };
 
+use crate::config::SavedPreview;
 use crate::i18n::t;
 
 /// The most a preview reads.
@@ -97,6 +98,8 @@ enum Content {
 
 struct Tab {
     machine: String,
+    /// How the file was read (see locate::source_tag); None: through Rex.
+    source: Option<String>,
     path: String,
     name: String,
     content: Content,
@@ -124,36 +127,44 @@ impl PreviewPanel {
         self.tabs.is_empty()
     }
 
-    /// The open files as (machine, path), in tab order.
-    pub fn files(&self) -> Vec<(String, String)> {
-        self.tabs.iter().map(|t| (t.machine.clone(), t.path.clone())).collect()
+    /// The open files that can be read again later, in tab order.
+    pub fn files(&self) -> Vec<SavedPreview> {
+        self.tabs
+            .iter()
+            .filter_map(|t| Some(SavedPreview { machine: t.machine.clone(), path: t.path.clone(), source: t.source.clone()? }))
+            .collect()
     }
 
     /// Shows `path` of `machine` (a new tab, or the one already open), read through `fs`.
-    pub fn open(&mut self, machine: String, path: String, fs: Arc<dyn FileSystem>, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(i) = self.tabs.iter().position(|t| t.machine == machine && t.path == path) {
+    pub fn open(&mut self, machine: String, source: Option<String>, path: String, fs: Arc<dyn FileSystem>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(i) = self.tabs.iter().position(|t| t.machine == machine && t.source == source && t.path == path) {
             self.active = i;
             cx.notify();
             return;
         }
         let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-        self.tabs.push(Tab { machine: machine.clone(), path: path.clone(), name: name.clone(), content: Content::Loading });
+        self.tabs.push(Tab { machine: machine.clone(), source: source.clone(), path: path.clone(), name: name.clone(), content: Content::Loading });
         self.active = self.tabs.len() - 1;
         cx.notify();
         let p = path.clone();
         cx.spawn_in(window, async move |this, cx| {
             let read = cx
                 .background_spawn(async move {
-                    let entry = fs.stat(&p)?;
+                    // Only regular files: opening a pipe or a device would block.
+                    let entry = fs.stat_target(&p)?;
+                    if entry.kind != files::Kind::File {
+                        return Ok((entry, Vec::new()));
+                    }
                     let size = entry.size.unwrap_or(0);
                     let bytes = if size > PREVIEW_MAX { Vec::new() } else { fs.read(&p, PREVIEW_MAX + 1)? };
                     Ok::<_, files::FsError>((entry, bytes))
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
-                let Some(tab) = this.tabs.iter_mut().find(|t| t.machine == machine && t.path == path) else { return };
+                let Some(tab) = this.tabs.iter_mut().find(|t| t.machine == machine && t.source == source && t.path == path) else { return };
                 tab.content = match read {
                     Err(e) => Content::Info(crate::file_panel::fs_error_text(&e)),
+                    Ok((entry, _)) if entry.kind != files::Kind::File => Content::Info(t("Not a regular file: nothing to preview.", "不是普通文件:没有可预览的内容。").into()),
                     Ok((entry, bytes)) => {
                         let size = entry.size.unwrap_or(bytes.len() as u64).max(bytes.len() as u64);
                         match classify(&name, &bytes, size) {
