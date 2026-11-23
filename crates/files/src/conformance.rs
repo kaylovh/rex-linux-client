@@ -100,3 +100,32 @@ pub fn run_write(fs: &dyn FileSystem, root: &str, seed: &dyn Fn(&str, &[u8]), li
     assert_eq!(fs.link_count(&p).unwrap(), Some(2));
     assert_eq!(fs.link_count(&b).unwrap(), Some(1));
 }
+
+/// Chunked writes and reads: offsets, a 5 MB file, streaming from an offset, stopping a stream.
+pub fn run_chunks(fs: &dyn FileSystem, root: &str) {
+    let p = join(root, "chunked it's.bin");
+    let data: Vec<u8> = (0..5_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    for (i, part) in data.chunks(1 << 20).enumerate() {
+        fs.write_chunk(&p, (i << 20) as u64, part).unwrap();
+    }
+    assert_eq!(fs.stat(&p).unwrap().size, Some(data.len() as u64));
+    assert_eq!(fs.read_chunk(&p, 123_457, 99_999).unwrap(), &data[123_457..123_457 + 99_999]);
+    assert!(fs.read_chunk(&p, data.len() as u64, 10).unwrap().is_empty());
+    let mut got = Vec::new();
+    assert!(fs.read_stream(&p, 1_000_001, &mut |b| {
+        got.extend_from_slice(b);
+        true
+    })
+    .unwrap());
+    assert_eq!(got, &data[1_000_001..]);
+    let mut seen = 0usize;
+    assert!(!fs.read_stream(&p, 0, &mut |b| {
+        seen += b.len();
+        seen < 2_000_000
+    })
+    .unwrap());
+    // A chunk past the end extends; a chunk inside never truncates.
+    fs.write_chunk(&p, 0, b"XY").unwrap();
+    assert_eq!(fs.stat(&p).unwrap().size, Some(data.len() as u64));
+    assert_eq!(fs.read_chunk(&p, 0, 3).unwrap(), [b'X', b'Y', data[2]]);
+}

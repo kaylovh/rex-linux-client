@@ -146,6 +146,22 @@ impl FileSystem for LocalFs {
         f.sync_all().map_err(err)
     }
 
+    fn read_chunk(&self, path: &str, offset: u64, max: usize) -> Result<Vec<u8>, FsError> {
+        use std::io::{Seek, SeekFrom};
+        let mut f = fs::File::open(path).map_err(err)?;
+        f.seek(SeekFrom::Start(offset)).map_err(err)?;
+        let mut out = Vec::with_capacity(max.min(1 << 20));
+        f.take(max as u64).read_to_end(&mut out).map_err(err)?;
+        Ok(out)
+    }
+
+    fn write_chunk(&self, path: &str, offset: u64, bytes: &[u8]) -> Result<(), FsError> {
+        use std::io::{Seek, SeekFrom};
+        let mut f = fs::OpenOptions::new().write(true).create(true).truncate(false).open(path).map_err(err)?;
+        f.seek(SeekFrom::Start(offset)).map_err(err)?;
+        f.write_all(bytes).map_err(err)
+    }
+
     fn set_mode(&self, path: &str, mode: u32) -> Result<(), FsError> {
         fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777)).map_err(err)
     }
@@ -176,6 +192,11 @@ mod tests {
             &|target, p| std::os::unix::fs::symlink(target, p).unwrap(),
         );
         assert_eq!(LocalFs.stat(&format!("{root}/big.bin")).unwrap().nlink, Some(1));
+    }
+
+    #[test]
+    fn local_chunks() {
+        crate::conformance::run_chunks(&LocalFs, &temp_root("local-chunks"));
     }
 
     #[test]

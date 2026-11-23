@@ -122,6 +122,35 @@ impl FileSystem for RexFs {
         Ok(out)
     }
 
+    fn read_stream(&self, path: &str, offset: u64, f: &mut dyn FnMut(&[u8]) -> bool) -> Result<bool, FsError> {
+        // Rex streams a download from the start: the first `offset` bytes are skipped.
+        let v = self.call("com.superlogical.terminal.download_begin", json!({"ref": download_ref(), "path": path}))?;
+        let ticket = v["ticket"].as_str().ok_or_else(|| FsError::Other("no download ticket".into()))?;
+        let mut conn = DataConn::open(&self.endpoint, ticket, BYTES_V1).map_err(|e| FsError::Gone(e.to_string()))?;
+        let mut skip = offset;
+        let result = loop {
+            match conn.next() {
+                Ok(DataItem::Bytes(b)) => {
+                    let b = if skip >= b.len() as u64 {
+                        skip -= b.len() as u64;
+                        continue;
+                    } else {
+                        let s = skip as usize;
+                        skip = 0;
+                        &b[s..]
+                    };
+                    if !f(b) {
+                        break Ok(false);
+                    }
+                }
+                Ok(DataItem::Closed(_)) => break Ok(true),
+                Err(e) => break Err(FsError::Gone(e.to_string())),
+            }
+        };
+        conn.close();
+        result
+    }
+
     fn create_file(&self, _path: &str) -> Result<(), FsError> {
         read_only()
     }

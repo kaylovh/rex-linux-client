@@ -104,6 +104,31 @@ pub trait FileSystem: Send + Sync {
     /// Writes a whole file: a new one (Exists if anything is there; created with `mode` when
     /// given, so it is never more open than that) or over an existing one.
     fn write_file(&self, path: &str, bytes: &[u8], create_new: bool, mode: Option<u32>) -> Result<(), FsError>;
+    /// Up to `max` bytes from `offset`; empty at the end of the file.
+    fn read_chunk(&self, path: &str, offset: u64, max: usize) -> Result<Vec<u8>, FsError> {
+        let _ = (path, offset, max);
+        Err(FsError::Unsupported("reading part of a file".into()))
+    }
+    /// Writes `bytes` at `offset`, creating the file if needed; never truncates it.
+    fn write_chunk(&self, path: &str, offset: u64, bytes: &[u8]) -> Result<(), FsError> {
+        let _ = (path, offset, bytes);
+        Err(FsError::Unsupported("writing part of a file".into()))
+    }
+    /// Hands the file from `offset` to `f` piece by piece; `f` returning false stops it
+    /// (then the result is Ok(false)).
+    fn read_stream(&self, path: &str, offset: u64, f: &mut dyn FnMut(&[u8]) -> bool) -> Result<bool, FsError> {
+        let mut at = offset;
+        loop {
+            let piece = self.read_chunk(path, at, STREAM_PIECE)?;
+            if piece.is_empty() {
+                return Ok(true);
+            }
+            at += piece.len() as u64;
+            if !f(&piece) {
+                return Ok(false);
+            }
+        }
+    }
     /// How many hard links the file has, when the source can tell.
     fn link_count(&self, path: &str) -> Result<Option<u64>, FsError> {
         self.stat_target(path).map(|e| e.nlink)
@@ -113,6 +138,9 @@ pub trait FileSystem: Send + Sync {
     /// Renames `from` to `to` in one step, replacing `to`; Unsupported when the server can't.
     fn replace(&self, from: &str, to: &str) -> Result<(), FsError>;
 }
+
+/// How much a stream reads at a time.
+pub const STREAM_PIECE: usize = 1 << 20;
 
 /// `dir` + "/" + `name`.
 pub fn join(dir: &str, name: &str) -> String {

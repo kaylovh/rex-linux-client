@@ -15,6 +15,8 @@ use crate::{FileEntry, FileSystem, FsError, Kind, Listing, join};
 
 /// The most one READ asks for.
 const CHUNK: u32 = 32 * 1024;
+/// Requests in flight at once for reads and writes of a chunk.
+const WINDOW: usize = 16;
 /// A packet bigger than this is a broken stream, not a reply.
 const MAX_PACKET: usize = 1 << 20;
 
@@ -120,6 +122,87 @@ impl Conn {
         }
         Self::status_of(t, &body)?;
         Err(Fail::Bad("no handle".into()))
+    }
+
+    /// Reads `len` bytes from `offset` with up to WINDOW requests in flight; stops at EOF.
+    fn read_range(&mut self, h: &[u8], offset: u64, len: usize) -> Result<Vec<u8>, Fail> {
+        let end = offset + len as u64;
+        let mut next = offset;
+        let mut pending: std::collections::HashMap<u32, (u64, u32)> = std::collections::HashMap::new();
+        let mut got: std::collections::BTreeMap<u64, Vec<u8>> = std::collections::BTreeMap::new();
+        let mut eof: Option<u64> = None;
+        loop {
+            while pending.len() < WINDOW && next < end && eof.is_none() {
+                let n = (end - next).min(u64::from(CHUNK)) as u32;
+                let id = self.id();
+                self.send(&Out::new(wire::READ).u32(id).bytes(h).u64(next).u32(n).finish())?;
+                pending.insert(id, (next, n));
+                next += u64::from(n);
+            }
+            if pending.is_empty() {
+                break;
+            }
+            let body = self.recv()?;
+            let mut r = In::new(&body);
+            let (Ok(t), Ok(id)) = (r.u8(), r.u32()) else { return Err(Fail::Gone("short reply".into())) };
+            let Some((at, n)) = pending.remove(&id) else { continue };
+            match t {
+                wire::DATA => {
+                    let data = r.bytes().map_err(|_| Fail::Bad("short data".into()))?.to_vec();
+                    if (data.len() as u32) < n {
+                        // A short read: the file ends here.
+                        let stop = at + data.len() as u64;
+                        eof = Some(eof.map_or(stop, |e| e.min(stop)));
+                    }
+                    got.insert(at, data);
+                }
+                _ => match Self::status_of(t, &body[5..]) {
+                    Err(Fail::Status(wire::FX_EOF, _)) => eof = Some(eof.map_or(at, |e| e.min(at))),
+                    Err(e) => return Err(e),
+                    Ok(()) => {}
+                },
+            }
+        }
+        let mut out = Vec::new();
+        for (at, data) in got {
+            if at != offset + out.len() as u64 {
+                break;
+            }
+            out.extend_from_slice(&data);
+        }
+        if let Some(e) = eof {
+            out.truncate(e.saturating_sub(offset) as usize);
+        }
+        Ok(out)
+    }
+
+    /// Writes `bytes` at `offset` with up to WINDOW requests in flight.
+    fn write_range(&mut self, h: &[u8], offset: u64, bytes: &[u8]) -> Result<(), Fail> {
+        let mut pending = std::collections::HashSet::new();
+        let mut sent = 0usize;
+        let mut first_err = None;
+        loop {
+            while pending.len() < WINDOW && sent < bytes.len() && first_err.is_none() {
+                let end = (sent + CHUNK as usize).min(bytes.len());
+                let id = self.id();
+                self.send(&Out::new(wire::WRITE).u32(id).bytes(h).u64(offset + sent as u64).bytes(&bytes[sent..end]).finish())?;
+                pending.insert(id);
+                sent = end;
+            }
+            if pending.is_empty() {
+                break;
+            }
+            let body = self.recv()?;
+            let mut r = In::new(&body);
+            let (Ok(t), Ok(id)) = (r.u8(), r.u32()) else { return Err(Fail::Gone("short reply".into())) };
+            if !pending.remove(&id) {
+                continue;
+            }
+            if let Err(e) = Self::status_of(t, &body[5..]) {
+                first_err.get_or_insert(e);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
     }
 
     fn close(&mut self, handle: &[u8]) {
@@ -471,6 +554,24 @@ impl FileSystem for SftpFs {
         .map_err(exists_err)
     }
 
+    fn read_chunk(&self, path: &str, offset: u64, max: usize) -> Result<Vec<u8>, FsError> {
+        self.with(|c| {
+            let h = c.handle(wire::OPEN, |o| o.str(path).u32(wire::READ_FLAG).attrs(&Attrs::default()))?;
+            let r = c.read_range(&h, offset, max);
+            c.close(&h);
+            r
+        })
+    }
+
+    fn write_chunk(&self, path: &str, offset: u64, bytes: &[u8]) -> Result<(), FsError> {
+        self.with(|c| {
+            let h = c.handle(wire::OPEN, |o| o.str(path).u32(wire::WRITE_FLAG | wire::CREAT).attrs(&Attrs::default()))?;
+            let r = c.write_range(&h, offset, bytes);
+            let closed = c.simple(wire::CLOSE, |o| o.bytes(&h));
+            r.and(closed)
+        })
+    }
+
     fn link_count(&self, path: &str) -> Result<Option<u64>, FsError> {
         // SFTP v3 has no link count; the long name in the folder's listing does.
         let real = self.resolve(path)?;
@@ -561,6 +662,13 @@ mod tests {
         let Some(argv) = server_argv(&root) else { return };
         let fs = SftpFs::spawn(argv).unwrap();
         crate::save::tests::save_cases(&fs, &root);
+    }
+
+    #[test]
+    fn sftp_chunks() {
+        let root = temp_root("chunks");
+        let Some(argv) = server_argv(&root) else { return };
+        crate::conformance::run_chunks(&SftpFs::spawn(argv).unwrap(), &root);
     }
 
     #[test]
