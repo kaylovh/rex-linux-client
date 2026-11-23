@@ -3,6 +3,7 @@
 
 pub mod local;
 pub mod rex;
+pub mod save;
 pub mod sftp;
 #[cfg(test)]
 pub(crate) mod conformance;

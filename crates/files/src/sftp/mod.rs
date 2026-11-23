@@ -533,6 +533,14 @@ mod tests {
     }
 
     #[test]
+    fn sftp_save_cases() {
+        let root = temp_root("save");
+        let Some(argv) = server_argv(&root) else { return };
+        let fs = SftpFs::spawn(argv).unwrap();
+        crate::save::tests::save_cases(&fs, &root);
+    }
+
+    #[test]
     fn dead_server_is_gone_then_respawns() {
         let root = temp_root("dead");
         let Some(argv) = server_argv(&root) else { return };
