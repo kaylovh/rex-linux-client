@@ -5,6 +5,7 @@
 //! Without -S it shows this computer and the machines in the settings; with -S only that one.
 
 mod config;
+mod dock;
 mod file_panel;
 mod fonts;
 mod hosts;

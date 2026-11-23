@@ -184,6 +184,10 @@ impl PreviewPanel {
         self.tabs.is_empty()
     }
 
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
     /// The open files that can be read again later, in tab order.
     pub fn files(&self) -> Vec<SavedPreview> {
         self.tabs

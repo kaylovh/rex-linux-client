@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_cn::{
-    Button, ButtonSize, CommandDialog, CommandEvent, CommandItem, CommandState, Dialog, Input, Sidebar, SidebarGroup, SidebarLayout, SidebarMenuButton,
-    SidebarState, Tab, Tabs, TabsEvent, TabsState,
+    Button, ButtonSize, CommandDialog, CommandEvent, CommandItem, CommandState, Dialog, Input, Sidebar, SidebarGroup, SidebarMenuButton,
+    Tab, Tabs, TabsEvent, TabsState,
 };
 use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::assets::IconName;
@@ -32,6 +32,7 @@ use crate::keys::gui_command;
 use crate::machines::{ConnState, MachineSpec, StartChoice, after_reconnect, start_choice, state_target, status_line};
 use crate::palette::{PaletteAction, PaletteEntry, PaletteSession, palette_entries, session_name};
 use crate::file_panel::{FilePanel, PanelEvent};
+use crate::dock::{Docks, Panel, Side};
 use crate::preview::{PreviewEvent, PreviewPanel};
 use crate::transfers::{Direction as XferDirection, NewTransfer, Queue, State as XferState, TransferId};
 use files::transfer::{CopyError, Flow, ItemKind, Progress as XferProgress, copy_file, copy_tree, plan_tree, unique_name};
@@ -246,7 +247,6 @@ pub struct Workspace {
     tabs: Entity<TabsState>,
     /// A tab's name is being edited (the terminal must not take the focus).
     tab_renaming: bool,
-    sidebar: Entity<SidebarState>,
     /// A message for the whole window (connecting, failed).
     banner: Option<String>,
     /// Standing warnings (a broken settings file, skipped machines), until clicked away or the settings are saved.
@@ -265,7 +265,14 @@ pub struct Workspace {
     fetching_view: bool,
     modal: Modal,
     transfers: Queue,
-    transfers_open: bool,
+    /// Where the panels sit (status bar toggles, drag to resize).
+    docks: Docks,
+    /// A dock edge being dragged: (panel, pointer at the start, size at the start).
+    dock_drag: Option<(Panel, f32, f32)>,
+    /// The status bar menu for moving a panel.
+    dock_menu: Option<Panel>,
+    /// Preview tabs last seen (the preview opens when one is added, closes with the last).
+    preview_tabs: usize,
     /// Each transfer's source and target file systems (kept for Retry).
     transfer_fs: std::collections::HashMap<TransferId, (Arc<dyn files::FileSystem>, Arc<dyn files::FileSystem>)>,
     /// Running transfers: progress (done, total) and the stop flag.
@@ -274,7 +281,6 @@ pub struct Workspace {
     /// Quitting was confirmed with transfers running.
     quit_with_transfers: bool,
     files: Entity<FilePanel>,
-    files_open: bool,
     /// Restored once their machine connects: the pinned folder, the open previews.
     pending_pin: Option<(String, String)>,
     pending_previews: Vec<crate::config::SavedPreview>,
@@ -299,10 +305,7 @@ impl Workspace {
     pub fn new(init: Init, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let tabs = cx.new(|_| TabsState::new([]));
         let st = &init.state;
-        let sidebar = cx.new(|cx| {
-            let s = SidebarState::new(cx).with_width(px(st.sidebar_width.unwrap_or(220.).clamp(140., 600.)));
-            if st.sidebar_open { s } else { s.closed() }
-        });
+        let docks = st.docks.clone().map(Docks::normalized).unwrap_or_else(|| Docks::from_old(st.sidebar_open, st.sidebar_width, st.files.open));
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let this = cx.weak_entity();
@@ -316,6 +319,7 @@ impl Workspace {
         let preview = cx.new(|_| PreviewPanel::new());
         cx.subscribe_in(&preview, window, |this, _, ev: &PreviewEvent, window, cx| match ev {
             PreviewEvent::Closed => {
+                this.sync_preview_dock(cx);
                 this.save_state(window, cx);
                 cx.notify();
             }
@@ -361,7 +365,6 @@ impl Workspace {
             panes: PaneSet::default(),
             tabs: tabs.clone(),
             tab_renaming: false,
-            sidebar,
             banner: None,
             notices: init.notices,
             saved: (init.state.machine.clone(), init.state.session.clone()),
@@ -374,13 +377,15 @@ impl Workspace {
             fetching_view: false,
             modal: Modal::None,
             transfers: Queue::default(),
-            transfers_open: false,
+            docks,
+            dock_drag: None,
+            dock_menu: None,
+            preview_tabs: 0,
             transfer_fs: std::collections::HashMap::new(),
             transfer_runs: std::collections::HashMap::new(),
             transfer_tick: None,
             quit_with_transfers: false,
             files,
-            files_open: files_state.open,
             pending_pin: files_state.pinned,
             pending_previews: init.state.previews.clone(),
             pin_target: None,
@@ -705,7 +710,6 @@ impl Workspace {
     /// Writes which machine and session are shown, the sidebar and the window size.
     pub fn save_state(&self, window: &Window, cx: &App) {
         let (Some(dir), true) = (&self.config, self.save_enabled) else { return };
-        let sb = self.sidebar.read(cx);
         let size = window.bounds().size;
         let sid = self.sid();
         let shown = self.shown.as_deref().map(|m| (m, sid.as_deref()));
@@ -721,7 +725,7 @@ impl Workspace {
         } else {
             None
         };
-        let files = FilesState { open: self.files_open, pinned, show_hidden: panel.show_hidden() };
+        let files = FilesState { open: self.docks.is_open(Panel::Files), pinned, show_hidden: panel.show_hidden() };
         let mut previews = self.preview.read(cx).files();
         previews.extend(self.pending_previews.iter().cloned());
         let state = WorkspaceState {
@@ -729,9 +733,10 @@ impl Workspace {
             previews,
             machine,
             session,
-            sidebar_open: sb.is_open(),
-            sidebar_width: Some(f32::from(sb.width())),
+            sidebar_open: self.docks.is_open(Panel::Sessions),
+            sidebar_width: Some(self.docks.get(Panel::Sessions).size),
             window_size: Some((f32::from(size.width), f32::from(size.height))),
+            docks: Some(self.docks.clone()),
         };
         let _ = config::save_state(dir, &state);
     }
@@ -983,7 +988,7 @@ impl Workspace {
         let terminal = cx.new(|cx| TerminalState::new(engine, terminal_config(&self.settings.font), window, cx));
         cx.observe_in(&terminal, window, |this, _, window, cx| {
             // A cd in the focused terminal moves a following file panel.
-            if this.files_open {
+            if this.docks.is_open(Panel::Files) {
                 this.follow(window, cx);
             }
             cx.notify();
@@ -1135,12 +1140,11 @@ impl Workspace {
                 return;
             }
             Command::ToggleTransfers => {
-                self.transfers_open = !self.transfers_open;
-                cx.notify();
+                self.toggle_panel(Panel::Transfers, window, cx);
                 return;
             }
             Command::ToggleFiles => {
-                self.files_open = !self.files_open;
+                self.docks.toggle(Panel::Files);
                 self.last_follow = None;
                 self.refresh_file_machines(cx);
                 self.follow(window, cx);
@@ -1238,8 +1242,7 @@ impl Workspace {
             Command::Search => self.open_search(window, cx),
             Command::ServerInfo | Command::ToggleFiles | Command::Save | Command::ToggleTransfers => {}
             Command::ToggleSidebar => {
-                self.sidebar.update(cx, |s, cx| s.toggle(cx));
-                self.save_state(window, cx);
+                self.toggle_panel(Panel::Sessions, window, cx);
             }
             Command::Quit => {
                 if self.request_close(window, cx) {
@@ -1617,7 +1620,7 @@ impl Workspace {
 
     /// Moves a following file panel to the focused terminal's machine and folder.
     fn follow(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.files_open || self.files.read(cx).pinned() {
+        if !self.docks.is_open(Panel::Files) || self.files.read(cx).pinned() {
             return;
         }
         let Some((key, name, source, dir)) = self.focused_source(cx) else { return };
@@ -2003,7 +2006,7 @@ impl Workspace {
                     this.transfers.set_resume(id, part && resume && !exists);
                     this.transfer_fs.insert(id, (src_fs.clone(), dst_fs.clone()));
                 }
-                this.transfers_open = true;
+                this.docks.set_open(Panel::Transfers, true);
                 this.pump_transfers(window, cx);
                 cx.notify();
             });
@@ -2104,10 +2107,7 @@ impl Workspace {
         self.machine(key).map(|m| m.spec.name.clone()).unwrap_or_else(|| key.to_string())
     }
 
-    fn render_transfers(&self, cx: &mut Context<Self>) -> Option<Div> {
-        if !self.transfers_open || self.transfers.items().is_empty() {
-            return None;
-        }
+    fn render_transfers(&self, cx: &mut Context<Self>) -> Div {
         let mut list = div().flex().flex_col().gap_0p5().overflow_hidden();
         for x in self.transfers.items().iter().rev() {
             let t_ = t;
@@ -2171,11 +2171,13 @@ impl Workspace {
                 this.transfer_fs.retain(|id, _| left.contains(id));
                 cx.notify();
             })))
-            .child(Button::new("xfer-hide").ghost().size(ButtonSize::Xs).icon(IconName::X).tooltip(t("Hide", "隐藏")).on_click(cx.listener(|this, _, _, cx| {
-                this.transfers_open = false;
-                cx.notify();
+            .child(Button::new("xfer-hide").ghost().size(ButtonSize::Xs).icon(IconName::X).tooltip(t("Hide", "隐藏")).on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_panel(Panel::Transfers, window, cx);
             })));
-        Some(div().flex_none().max_h(px(180.)).py_1().border_t_1().border_color(rgb(crate::theme::ui().border)).bg(rgb(crate::theme::ui().panel)).flex().flex_col().gap_1().child(header).child(list))
+        if self.transfers.items().is_empty() {
+            list = list.child(div().px_2().text_xs().text_color(rgb(crate::theme::ui().muted)).child(t("No transfers yet. Upload or download from the file panel.", "还没有传输。可在文件栏上传或下载。")));
+        }
+        div().size_full().py_1().flex().flex_col().gap_1().overflow_hidden().child(header).child(list)
     }
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2611,8 +2613,6 @@ impl Workspace {
             .gap_0p5()
             .px_2()
             .child(tool("tb-search", IconName::Search, format!("{} ({main}-F)", t("Search scrollback", "搜索回滚内容")), Command::Search, false, cx))
-            .child(tool("tb-files", IconName::FolderTree, format!("{} ({main}-O)", t("Files", "文件栏")), Command::ToggleFiles, self.files_open, cx))
-            .child(tool("tb-transfers", IconName::ArrowUpDown, t("Transfers", "传输列表").to_string(), Command::ToggleTransfers, self.transfers_open, cx))
             .child(tool("tb-palette", IconName::Command, format!("{} ({main}-P)", t("Command palette", "命令面板")), Command::Palette, false, cx))
             .child(tool("tb-settings", IconName::Settings, format!("{} ({main}-,)", t("Settings", "设置")), Command::Settings, false, cx))
     }
@@ -2762,18 +2762,251 @@ impl Workspace {
     }
 }
 
+impl Workspace {
+    fn panel_name(p: Panel) -> &'static str {
+        match p {
+            Panel::Sessions => t("Sessions", "会话列表"),
+            Panel::Files => t("Files", "文件栏"),
+            Panel::Preview => t("Preview", "预览"),
+            Panel::Transfers => t("Transfers", "传输列表"),
+        }
+    }
+
+    fn panel_icon(p: Panel) -> IconName {
+        match p {
+            Panel::Sessions => IconName::SquareTerminal,
+            Panel::Files => IconName::FolderTree,
+            Panel::Preview => IconName::FileText,
+            Panel::Transfers => IconName::ArrowUpDown,
+        }
+    }
+
+    fn toggle_panel(&mut self, p: Panel, window: &mut Window, cx: &mut Context<Self>) {
+        self.docks.toggle(p);
+        if p == Panel::Files && self.docks.is_open(Panel::Files) {
+            self.last_follow = None;
+            self.refresh_file_machines(cx);
+            self.follow(window, cx);
+        }
+        self.save_state(window, cx);
+        cx.notify();
+    }
+
+    /// The preview shows when a file is opened in it and hides with its last tab.
+    fn sync_preview_dock(&mut self, cx: &mut Context<Self>) {
+        let n = self.preview.read(cx).tab_count();
+        if n > self.preview_tabs {
+            self.docks.set_open(Panel::Preview, true);
+        } else if n == 0 && self.preview_tabs > 0 {
+            self.docks.set_open(Panel::Preview, false);
+        }
+        self.preview_tabs = n;
+    }
+
+    fn panel_view(&self, p: Panel, cx: &mut Context<Self>) -> AnyElement {
+        match p {
+            Panel::Sessions => {
+                let ui = crate::theme::ui();
+                div().size_full().overflow_hidden().child(self.render_sidebar(cx).bg(rgb(ui.panel)).border_0()).into_any_element()
+            }
+            Panel::Files => self.files.clone().into_any_element(),
+            Panel::Preview if self.preview.read(cx).is_empty() => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(rgb(crate::theme::ui().muted))
+                .child(t("Open a file from the file panel to preview it here.", "在文件栏里打开文件,会在这里预览。"))
+                .into_any_element(),
+            Panel::Preview => self.preview.clone().into_any_element(),
+            Panel::Transfers => self.render_transfers(cx).into_any_element(),
+        }
+    }
+
+    /// The open panels of one side, each with a drag handle on its inner edge.
+    fn render_dock(&self, side: Side, cx: &mut Context<Self>) -> Option<Div> {
+        let shown = self.docks.shown(side);
+        if shown.is_empty() {
+            return None;
+        }
+        let ui = crate::theme::ui();
+        let mut dock = div().flex_none().flex().bg(rgb(ui.panel));
+        dock = match side {
+            Side::Bottom => dock.w_full().h(px(shown[0].size)).border_t_1().border_color(rgb(ui.border)),
+            _ => dock.h_full(),
+        };
+        for (i, s) in shown.iter().enumerate() {
+            let p = s.panel;
+            let mut cell = div().relative().h_full().min_w_0().overflow_hidden();
+            cell = match side {
+                Side::Left => cell.flex_none().w(px(s.size)).border_r_1().border_color(rgb(ui.border)),
+                Side::Right => cell.flex_none().w(px(s.size)).border_l_1().border_color(rgb(ui.border)),
+                Side::Bottom => cell.flex_1().when(i > 0, |d| d.border_l_1().border_color(rgb(ui.border))),
+            };
+            let size = s.size;
+            let handle = div()
+                .id(SharedString::from(format!("dock-handle-{p:?}")))
+                .absolute()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                        let at = if side == Side::Bottom { f32::from(e.position.y) } else { f32::from(e.position.x) };
+                        this.dock_drag = Some((p, at, size));
+                        cx.stop_propagation();
+                    }),
+                );
+            let handle = match side {
+                Side::Left => handle.top_0().bottom_0().right(px(-3.)).w(px(6.)).cursor_col_resize(),
+                Side::Right => handle.top_0().bottom_0().left(px(-3.)).w(px(6.)).cursor_col_resize(),
+                Side::Bottom => handle.left_0().right_0().top(px(-3.)).h(px(6.)).cursor_row_resize(),
+            };
+            cell = cell.child(self.panel_view(p, cx));
+            if side != Side::Bottom || i == 0 {
+                cell = cell.child(handle);
+            }
+            dock = dock.child(cell);
+        }
+        Some(dock)
+    }
+
+    /// The bottom bar: panel toggles at the edges their panels sit on, the status in the middle.
+    fn render_status_bar(&self, status: Option<String>, cx: &mut Context<Self>) -> Div {
+        let ui = crate::theme::ui();
+        let toggle = |p: Panel, this: &Self, cx: &mut Context<Self>| {
+            let open = this.docks.is_open(p);
+            div()
+                .id(SharedString::from(format!("dock-toggle-{p:?}")))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, _, _, cx| {
+                        this.dock_menu = if this.dock_menu == Some(p) { None } else { Some(p) };
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("dock-btn-{p:?}")))
+                        .ghost()
+                        .size(ButtonSize::Xs)
+                        .icon(Self::panel_icon(p))
+                        .selected(open)
+                        .tooltip(format!("{} — {}", Self::panel_name(p), t("right-click to move", "右键可移动位置")))
+                        .on_click(cx.listener(move |this, _, window, cx| this.toggle_panel(p, window, cx))),
+                )
+        };
+        let mut bar = div()
+            .flex_none()
+            .h(px(28.))
+            .px_1()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .border_t_1()
+            .border_color(rgb(ui.border))
+            .bg(rgb(ui.panel))
+            .text_xs()
+            .text_color(rgb(ui.muted));
+        for p in self.docks.on(Side::Left) {
+            bar = bar.child(toggle(p, self, cx));
+        }
+        bar = bar.child(
+            div()
+                .id("status-line")
+                .flex_1()
+                .min_w_0()
+                .px_2()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .children(status)
+                // A click puts the standing notices away.
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.notices.clear();
+                    cx.notify();
+                })),
+        );
+        let active = self.transfers.active();
+        if active > 0 {
+            bar = bar.child(div().px_2().text_color(rgb(ui.accent)).child(format!("↑↓ {active} {}", t("transferring", "个传输中"))));
+        }
+        for p in self.docks.on(Side::Bottom).into_iter().chain(self.docks.on(Side::Right)) {
+            bar = bar.child(toggle(p, self, cx));
+        }
+        bar
+    }
+
+    /// The menu a right-click on a status bar toggle opens.
+    fn render_dock_menu(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let p = self.dock_menu?;
+        let ui = crate::theme::ui();
+        let current = self.docks.get(p).side;
+        let item = |id: &str, label: String, on: bool, cx: &mut Context<Self>, act: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>| {
+            div()
+                .id(SharedString::from(id.to_string()))
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .text_sm()
+                .text_color(rgb(if on { ui.accent } else { ui.text }))
+                .hover(|s| s.bg(rgb(ui.hover)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        act(this, window, cx);
+                        this.dock_menu = None;
+                        this.save_state(window, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(label)
+        };
+        let mut menu = div()
+            .absolute()
+            .bottom(px(30.))
+            .w(px(200.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .occlude()
+            .bg(rgb(ui.elevated))
+            .border_1()
+            .border_color(rgb(ui.border))
+            .rounded_md()
+            .child(div().px_2().py_0p5().text_xs().text_color(rgb(ui.muted)).child(Self::panel_name(p)));
+        menu = if current == Side::Left { menu.left(px(4.)) } else { menu.right(px(4.)) };
+        for (side, label) in [(Side::Left, t("Dock left", "停靠到左侧")), (Side::Right, t("Dock right", "停靠到右侧")), (Side::Bottom, t("Dock bottom", "停靠到底部"))] {
+            let on = current == side;
+            menu = menu.child(item(&format!("dock-to-{side:?}"), format!("{}{label}", if on { "✓ " } else { "   " }), on, cx, Box::new(move |this, _, _| this.docks.move_to(p, side))));
+        }
+        let open = self.docks.is_open(p);
+        menu = menu.child(item(
+            "dock-hide",
+            if open { t("Hide", "隐藏").to_string() } else { t("Show", "显示").to_string() },
+            false,
+            cx,
+            Box::new(move |this, window, cx| this.toggle_panel(p, window, cx)),
+        ));
+        Some(menu)
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_preview_dock(cx);
         let prefix = self.prefix.then(|| t("Ctrl-b … (press a key: c new tab, % split, z zoom, : palette)", "Ctrl-b …(再按一个键:c 新 tab、% 分屏、z 放大、: 命令面板)"));
         let conn = self.shown_machine().and_then(|m| m.conn.text().map(|s| format!("{}: {s}", m.spec.name)));
         let status = status_line(prefix, self.banner.as_deref(), conn.as_deref(), &self.notices);
-        let main = div()
+        let ui = crate::theme::ui();
+        let center = div()
             .flex_1()
             .min_w_0()
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgb(crate::theme::ui().panel))
+            .bg(rgb(ui.panel))
             .child(
                 div()
                     .flex_none()
@@ -2784,56 +3017,53 @@ impl Render for Workspace {
                     .child(self.render_toolbar(cx)),
             )
             .child(self.render_panes(cx))
-            .children(self.render_transfers(cx))
-            .when_some(status, |d, s| {
-                d.child(
-                    div()
-                        .id("status-line")
-                        .px_3()
-                        .py_1()
-                        .bg(rgb(crate::theme::ui().elevated))
-                        .text_color(rgb(crate::theme::ui().text))
-                        .text_sm()
-                        .child(s)
-                        // A click puts the standing notices away.
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.notices.clear();
-                            cx.notify();
-                        })),
-                )
-            });
+            .children(self.render_dock(Side::Bottom, cx));
+        let body = div().flex_1().min_h_0().w_full().flex().children(self.render_dock(Side::Left, cx)).child(center).children(self.render_dock(Side::Right, cx));
         div()
             .size_full()
             .relative()
+            .flex()
+            .flex_col()
+            .bg(rgb(ui.background))
+            .text_color(rgb(ui.text))
             .track_focus(&self.focus)
-            .child(
-                SidebarLayout::new(&self.sidebar).sidebar(self.render_sidebar(cx)).child(
-                    div().size_full().flex().child(main).when(!self.preview.read(cx).is_empty(), |d| {
-                        d.child(
-                            div()
-                                .w(relative(0.42))
-                                .flex_none()
-                                .h_full()
-                                .border_l_1()
-                                .border_color(rgb(crate::theme::ui().border))
-                                .bg(rgb(crate::theme::ui().panel))
-                                .child(self.preview.clone()),
-                        )
-                    })
-                    .when(self.files_open, |d| {
-                        d.child(
-                            div()
-                                .w(px(300.))
-                                .flex_none()
-                                .h_full()
-                                .border_l_1()
-                                .border_color(rgb(crate::theme::ui().border))
-                                .bg(rgb(crate::theme::ui().panel))
-                                .child(self.files.clone()),
-                        )
-                    }),
-                ),
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+                let Some((p, start, size)) = this.dock_drag else { return };
+                let side = this.docks.get(p).side;
+                let (x, y) = (f32::from(e.position.x), f32::from(e.position.y));
+                let next = match side {
+                    Side::Left => size + (x - start),
+                    Side::Right => size - (x - start),
+                    Side::Bottom => size - (y - start),
+                };
+                if side == Side::Bottom {
+                    for q in this.docks.on(Side::Bottom) {
+                        this.docks.resize(q, next);
+                    }
+                } else {
+                    this.docks.resize(p, next);
+                }
+                cx.notify();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    if this.dock_drag.take().is_some() {
+                        this.save_state(window, cx);
+                    }
+                }),
             )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.dock_menu.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(body)
+            .child(self.render_status_bar(status, cx))
+            .children(self.render_dock_menu(cx))
             .children(self.drag_overlay(cx))
             .children(self.render_modal(cx))
     }

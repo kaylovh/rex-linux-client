@@ -85,6 +85,8 @@ pub struct WorkspaceState {
     pub window_size: Option<(f32, f32)>,
     pub files: FilesState,
     pub previews: Vec<SavedPreview>,
+    /// Where the panels sit; None in a state from before docks.
+    pub docks: Option<crate::dock::Docks>,
 }
 
 impl Default for FontSettings {
@@ -100,7 +102,7 @@ impl Default for FontSettings {
 
 impl Default for WorkspaceState {
     fn default() -> Self {
-        Self { machine: None, session: None, sidebar_open: true, sidebar_width: None, window_size: None, files: FilesState::default(), previews: Vec::new() }
+        Self { machine: None, session: None, sidebar_open: true, sidebar_width: None, window_size: None, files: FilesState::default(), previews: Vec::new(), docks: None }
     }
 }
 
@@ -270,6 +272,7 @@ mod tests {
         let s = WorkspaceState {
             files: FilesState { open: true, pinned: Some(("m:dev".into(), "/srv/app".into())), show_hidden: true },
             previews: vec![SavedPreview { machine: "local".into(), path: "/etc/hosts".into(), source: "local".into() }],
+            docks: Some(crate::dock::Docks::default()),
             ..Default::default()
         };
         save_state(&d, &s).unwrap();
