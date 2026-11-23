@@ -146,6 +146,10 @@ impl FilePanel {
         }
     }
 
+    /// The file system shown now.
+    pub fn fs(&self) -> Option<Arc<dyn FileSystem>> {
+        self.fs.clone()
+    }
     pub fn machine(&self) -> Option<&str> {
         self.machine.as_deref()
     }

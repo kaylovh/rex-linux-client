@@ -31,6 +31,7 @@ use crate::keys::gui_command;
 use crate::machines::{ConnState, MachineSpec, StartChoice, after_reconnect, start_choice, state_target, status_line};
 use crate::palette::{PaletteAction, PaletteEntry, PaletteSession, palette_entries, session_name};
 use crate::file_panel::{FilePanel, PanelEvent};
+use crate::preview::{PreviewEvent, PreviewPanel};
 use crate::locate::{Source, cd_command, source_for_block, source_for_machine};
 use crate::machines::machine_specs;
 use crate::panes::{PaneEntry, PaneSet, PaneStatus, diff};
@@ -196,6 +197,7 @@ pub struct Workspace {
     modal: Modal,
     files: Entity<FilePanel>,
     files_open: bool,
+    preview: Entity<PreviewPanel>,
     /// What the file panel shows when following: (machine, source, folder).
     last_follow: Option<(String, Source, Option<String>)>,
     /// The source the file panel shows now.
@@ -226,6 +228,11 @@ impl Workspace {
         });
         let palette = cx.new(|cx| CommandState::new(t("Type a command or a session…", "输入命令或 session…"), window, cx));
         let files = cx.new(|cx| FilePanel::new(window, cx));
+        let preview = cx.new(|_| PreviewPanel::new());
+        cx.subscribe_in(&preview, window, |_, _, ev: &PreviewEvent, _, cx| match ev {
+            PreviewEvent::Empty => cx.notify(),
+        })
+        .detach();
         cx.subscribe_in(&files, window, Self::on_files_event).detach();
         cx.subscribe_in(&palette, window, |this, _, ev: &CommandEvent, window, cx| {
             if let CommandEvent::Confirmed(key) = ev {
@@ -264,6 +271,7 @@ impl Workspace {
             modal: Modal::None,
             files,
             files_open: false,
+            preview,
             last_follow: None,
             files_source: None,
             local_fs: Arc::new(files::local::LocalFs),
@@ -396,8 +404,11 @@ impl Workspace {
                         cx.notify();
                     });
                 }));
+                // Whether this machine was shown before this connect (a Retry), decided before
+                // syncing hosts: that sync may open the start session on it.
+                let was_shown = self.shown.as_deref() == Some(key);
                 self.sync_hosts(window, cx);
-                if self.shown.as_deref() == Some(key) {
+                if was_shown {
                     // The shown machine connected anew (Retry after a drop): its old panes
                     // belong to the closed connection; show the same session again.
                     self.leave(window, cx);
@@ -1457,7 +1468,12 @@ impl Workspace {
         }
     }
 
-    fn open_preview(&mut self, _path: String, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn open_preview(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = self.files.read(cx);
+        let (Some(machine), Some(fs)) = (panel.machine().map(str::to_string), panel.fs()) else { return };
+        self.preview.update(cx, |p, cx| p.open(machine, path, fs, window, cx));
+        cx.notify();
+    }
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pinned = self.machines.first().is_some_and(|m| m.spec.key == "cli");
@@ -1951,7 +1967,19 @@ impl Render for Workspace {
             .track_focus(&self.focus)
             .child(
                 SidebarLayout::new(&self.sidebar).sidebar(self.render_sidebar(cx)).child(
-                    div().size_full().flex().child(main).when(self.files_open, |d| {
+                    div().size_full().flex().child(main).when(!self.preview.read(cx).is_empty(), |d| {
+                        d.child(
+                            div()
+                                .w(relative(0.42))
+                                .flex_none()
+                                .h_full()
+                                .border_l_1()
+                                .border_color(rgb(0x2a2a2a))
+                                .bg(rgb(0x1e1e1e))
+                                .child(self.preview.clone()),
+                        )
+                    })
+                    .when(self.files_open, |d| {
                         d.child(
                             div()
                                 .w(px(300.))

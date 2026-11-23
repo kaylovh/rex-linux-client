@@ -13,6 +13,7 @@ mod keys;
 mod locate;
 mod machines;
 mod palette;
+mod preview;
 mod panes;
 mod server_info;
 mod settings_view;
@@ -116,6 +117,8 @@ fn main() {
         };
         let init = init.take().expect("run once");
         gpui_kit::open_window(options, cx, |window, cx| {
+            // The app draws a dark UI; the component theme (code views) matches it.
+            gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, Some(window), cx);
             let ws = cx.new(|cx| workspace::Workspace::new(init, window, cx));
             let w2 = ws.clone();
             window.on_window_should_close(cx, move |window, cx| {
