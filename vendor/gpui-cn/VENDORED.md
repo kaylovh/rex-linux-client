@@ -7,7 +7,7 @@ Local changes (each changed file says so at its top):
 
 - `src/terminal/options.rs`: `EngineOptions::with_snapshot` (start from a Ghostty snapshot)
   and `with_source_sized` (the source sets the grid size).
-- `src/terminal/core.rs`: `Core::from_snapshot`.
+- `src/terminal/core.rs`: `Core::from_snapshot` (keeps the folder the snapshot's terminal reported; the engine publishes it with the first snapshot).
 - `src/terminal/engine.rs`: `ByteHandle::route_input` / `InputRoute` (a source can take an
   input instead of having it encoded), `ByteSink::set_grid` (a grid change in stream order), and
   the engine changes behind them.

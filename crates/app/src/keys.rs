@@ -21,6 +21,7 @@ pub fn gui_command(ks: &Keystroke) -> Option<Command> {
             "enter" => Command::Zoom,
             "p" => Command::Palette,
             "f" => Command::Search,
+            "o" => Command::ToggleFiles,
             "," => Command::Settings,
             _ => return None,
         });
@@ -64,6 +65,7 @@ mod tests {
         assert_eq!(cmd(&format!("{main}enter")), Some(Command::Zoom));
         assert_eq!(cmd(&format!("{main}p")), Some(Command::Palette));
         assert_eq!(cmd(&format!("{main}f")), Some(Command::Search));
+        assert_eq!(cmd(&format!("{main}o")), Some(Command::ToggleFiles));
         let settings = if cfg!(target_os = "macos") { "cmd-," } else { "ctrl-shift-," };
         assert_eq!(cmd(settings), Some(Command::Settings));
         assert_eq!(cmd("ctrl-pagedown"), Some(Command::NextTab));

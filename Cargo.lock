@@ -6816,6 +6816,7 @@ dependencies = [
 name = "rexa-desktop"
 version = "1.0.0-dev"
 dependencies = [
+ "files",
  "gpui-cn",
  "gpui-kit",
  "rex-client",

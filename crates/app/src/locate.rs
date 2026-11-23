@@ -44,31 +44,6 @@ pub fn source_for_machine(machine: &MachineSpec, machine_host: Option<&str>, loc
     }
 }
 
-/// The directory an OSC 7 report names: file://host/path (%-encoded) or a plain absolute path.
-pub fn cwd_from_osc7(s: &str) -> Option<String> {
-    let path = match s.strip_prefix("file://") {
-        Some(rest) => &rest[rest.find('/')?..],
-        None if s.starts_with('/') => s,
-        None => return None,
-    };
-    let bytes = path.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(v) = u8::from_str_radix(&path[i + 1..i + 3], 16)
-        {
-            out.push(v);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    Some(String::from_utf8_lossy(&out).into_owned())
-}
-
 /// One shell word: single quotes, with ' written as '\''.
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -127,10 +102,6 @@ mod tests {
 
     #[test]
     fn osc7_and_quoting() {
-        assert_eq!(cwd_from_osc7("file://host/home/me/a%20b"), Some("/home/me/a b".into()));
-        assert_eq!(cwd_from_osc7("file:///home/me/%E4%B8%AD"), Some("/home/me/中".into()));
-        assert_eq!(cwd_from_osc7("/plain/path"), Some("/plain/path".into()));
-        assert_eq!(cwd_from_osc7("relative"), None);
         assert_eq!(shell_quote("it's dir"), r"'it'\''s dir'");
         assert_eq!(cd_command("-x"), "cd -- '-x'");
     }

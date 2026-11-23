@@ -5,6 +5,7 @@
 //! Without -S it shows this computer and the machines in the settings; with -S only that one.
 
 mod config;
+mod file_panel;
 mod fonts;
 mod hosts;
 mod i18n;
@@ -94,7 +95,7 @@ fn main() {
         notices,
     };
     let mut init = Some(init);
-    gpui_kit::application().with_assets(gpui_kit::assets::Assets).run(move |cx| {
+    gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
         gpui_kit::init(cx);
         gpui_cn::init(cx);
         fonts::register(cx);

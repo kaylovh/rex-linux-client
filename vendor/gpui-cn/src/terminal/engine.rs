@@ -873,6 +873,8 @@ impl Owner {
         let snapshot = TerminalSnapshot {
             frame,
             status: TerminalStatus::Live,
+            // A snapshot start knows the folder the program last reported.
+            cwd: core.cwd().cloned(),
             ..TerminalSnapshot::default()
         };
         sink.publish(Arc::new(snapshot.clone()));

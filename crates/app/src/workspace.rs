@@ -30,6 +30,8 @@ use crate::i18n::t;
 use crate::keys::gui_command;
 use crate::machines::{ConnState, MachineSpec, StartChoice, after_reconnect, start_choice, state_target, status_line};
 use crate::palette::{PaletteAction, PaletteEntry, PaletteSession, palette_entries, session_name};
+use crate::file_panel::{FilePanel, PanelEvent};
+use crate::locate::{Source, cd_command, source_for_block, source_for_machine};
 use crate::machines::machine_specs;
 use crate::panes::{PaneEntry, PaneSet, PaneStatus, diff};
 use crate::settings_view::{HostGroup, SettingsEvent, SettingsView, terminal_config};
@@ -192,6 +194,15 @@ pub struct Workspace {
     _subs: Vec<Subscription>,
     fetching_view: bool,
     modal: Modal,
+    files: Entity<FilePanel>,
+    files_open: bool,
+    /// What the file panel shows when following: (machine, source, folder).
+    last_follow: Option<(String, Source, Option<String>)>,
+    /// The source the file panel shows now.
+    files_source: Option<Source>,
+    local_fs: Arc<dyn files::FileSystem>,
+    /// One SFTP connection per ssh machine address.
+    sftp: std::collections::HashMap<String, Arc<dyn files::FileSystem>>,
     palette: Entity<CommandState>,
     palette_entries: Vec<PaletteEntry>,
     tasks: Vec<Task<()>>,
@@ -214,6 +225,8 @@ impl Workspace {
             }
         });
         let palette = cx.new(|cx| CommandState::new(t("Type a command or a session…", "输入命令或 session…"), window, cx));
+        let files = cx.new(|cx| FilePanel::new(window, cx));
+        cx.subscribe_in(&files, window, Self::on_files_event).detach();
         cx.subscribe_in(&palette, window, |this, _, ev: &CommandEvent, window, cx| {
             if let CommandEvent::Confirmed(key) = ev {
                 this.palette_chosen(key.to_string(), window, cx);
@@ -249,6 +262,12 @@ impl Workspace {
             _subs: vec![key_sub],
             fetching_view: false,
             modal: Modal::None,
+            files,
+            files_open: false,
+            last_follow: None,
+            files_source: None,
+            local_fs: Arc::new(files::local::LocalFs),
+            sftp: std::collections::HashMap::new(),
             palette,
             palette_entries: Vec::new(),
             tasks: Vec::new(),
@@ -540,6 +559,7 @@ impl Workspace {
             self.focused_block = focused;
             self.focus_terminal(window, cx);
         }
+        self.follow(window, cx);
         cx.notify();
     }
 
@@ -744,7 +764,14 @@ impl Workspace {
         let (source, events) = RexSource::new(block.clone(), attached);
         let engine = source.engine();
         let terminal = cx.new(|cx| TerminalState::new(engine, terminal_config(&self.settings.font), window, cx));
-        cx.observe(&terminal, |_, _, cx| cx.notify()).detach();
+        cx.observe_in(&terminal, window, |this, _, window, cx| {
+            // A cd in the focused terminal moves a following file panel.
+            if this.files_open {
+                this.follow(window, cx);
+            }
+            cx.notify();
+        })
+        .detach();
         let id = block.block_id.clone();
         entry.terminal = Some(terminal);
         entry.status = PaneStatus::Live;
@@ -884,6 +911,14 @@ impl Workspace {
 
     fn run(&mut self, cmd: Command, window: &mut Window, cx: &mut Context<Self>) {
         match cmd {
+            Command::ToggleFiles => {
+                self.files_open = !self.files_open;
+                self.last_follow = None;
+                self.refresh_file_machines(cx);
+                self.follow(window, cx);
+                cx.notify();
+                return;
+            }
             Command::ServerInfo => {
                 let key = self.shown.clone().or_else(|| self.machines.first().map(|m| m.spec.key.clone()));
                 if let Some(k) = key {
@@ -978,7 +1013,7 @@ impl Workspace {
             }
             Command::Palette | Command::Settings => {}
             Command::Search => self.open_search(window, cx),
-            Command::ServerInfo => {}
+            Command::ServerInfo | Command::ToggleFiles => {}
             Command::ToggleSidebar => {
                 self.sidebar.update(cx, |s, cx| s.toggle(cx));
                 self.save_state(window, cx);
@@ -1035,6 +1070,14 @@ impl Workspace {
             Modal::Search { input, .. } => Some(input.read(cx).focus_handle(cx).is_focused(window)),
             _ => None,
         };
+        // Typing in the file panel: keys are its own (Escape closes its name field).
+        if self.files.read(cx).typing(window, cx) {
+            self.prefix = false;
+            if ev.keystroke.key == "escape" {
+                self.files.update(cx, |f, cx| f.cancel_prompt(cx));
+            }
+            return;
+        }
         // A dialog, or the search field, takes every key: typing must not start commands.
         // With the search bar open but the terminal focused, keys work as usual.
         if !matches!(self.modal, Modal::None) && search_focused != Some(false) {
@@ -1296,6 +1339,125 @@ impl Workspace {
             });
         }));
     }
+
+    // ---- file panel -------------------------------------------------------------------
+
+    /// The host_id of this computer's files: the local server's, or a socket server's here.
+    fn local_host_id(&self) -> Option<String> {
+        self.machines
+            .iter()
+            .find(|m| m.spec.local)
+            .or_else(|| self.machines.iter().find(|m| m.spec.parent.is_none() && (m.spec.address.starts_with("unix://") || m.spec.address.starts_with('/'))))
+            .and_then(|m| m.host_id.clone())
+    }
+
+    fn refresh_file_machines(&mut self, cx: &mut Context<Self>) {
+        let list: Vec<(String, String)> = self.machines.iter().map(|m| (m.spec.key.clone(), m.spec.name.clone())).collect();
+        self.files.update(cx, |f, cx| f.set_machines(list, cx));
+    }
+
+    /// Where the focused terminal's files are, and its folder.
+    fn focused_source(&self, cx: &App) -> Option<(String, String, Source, Option<String>)> {
+        let m = self.shown_machine()?;
+        let sid = m.model.current.clone()?;
+        let block = self.focused_block.clone()?;
+        let block_host = self.layout.panes.iter().find(|p| p.block_id == block).map(|p| p.host_id.clone()).filter(|h| !h.is_empty());
+        let local = self.local_host_id();
+        let source = source_for_block(block_host.as_deref(), local.as_deref(), &m.spec, m.host_id.as_deref(), &sid, &block);
+        let dir = self.panes.terminal(&block).and_then(|t| t.read(cx).cwd().map(|p| p.to_string_lossy().into_owned()));
+        Some((m.spec.key.clone(), m.spec.name.clone(), source, dir))
+    }
+
+    /// Moves a following file panel to the focused terminal's machine and folder.
+    fn follow(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.files_open || self.files.read(cx).pinned() {
+            return;
+        }
+        let Some((key, name, source, dir)) = self.focused_source(cx) else { return };
+        let now = (key.clone(), source.clone(), dir.clone());
+        if self.last_follow.as_ref() == Some(&now) {
+            return;
+        }
+        self.last_follow = Some(now);
+        self.show_files(key, name, source, dir, window, cx);
+    }
+
+    fn show_files(&mut self, key: String, name: String, source: Source, dir: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.files_source = Some(source.clone());
+        let ready: Option<Result<Arc<dyn files::FileSystem>, String>> = match &source {
+            Source::Local => Some(Ok(self.local_fs.clone())),
+            Source::Sftp { address } => self.sftp.get(address).cloned().map(Ok),
+            Source::Rex { machine, session, block } => Some(
+                self.machine(machine)
+                    .and_then(|m| Some((m.spec.endpoint.clone(), m.control.clone()?)))
+                    .map(|(ep, c)| Arc::new(files::rex::RexFs::new(ep, c, session.clone(), block.clone())) as Arc<dyn files::FileSystem>)
+                    .ok_or_else(|| t("This machine isn't connected.", "这台机器没有连接。").to_string()),
+            ),
+            Source::Unavailable(why) => Some(Err(why.clone())),
+        };
+        if let Some(fs) = ready {
+            self.files.update(cx, |f, cx| f.set_location(key, name, fs, dir, cx));
+            return;
+        }
+        // A new SFTP connection: opened off the UI thread (ssh can take a while).
+        let Source::Sftp { address } = source else { return };
+        self.files.update(cx, |f, cx| f.set_location(key.clone(), name.clone(), Err(t("Connecting…", "正在连接…").into()), None, cx));
+        self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+            let a = address.clone();
+            let opened = cx
+                .background_spawn(async move {
+                    let argv = rex_proto::transport::sftp_command(&a).ok_or_else(|| "not an ssh address".to_string())?;
+                    files::sftp::SftpFs::spawn(argv).map_err(|e| crate::file_panel::fs_error_text(&e))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let fs = opened.map(|s| {
+                    let fs: Arc<dyn files::FileSystem> = Arc::new(s);
+                    this.sftp.insert(address.clone(), fs.clone());
+                    fs
+                });
+                this.files.update(cx, |f, cx| f.set_location(key, name, fs, dir, cx));
+            });
+        }));
+    }
+
+    fn on_files_event(&mut self, _: &Entity<FilePanel>, ev: &PanelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev {
+            PanelEvent::OpenFile { path } => self.open_preview(path.clone(), window, cx),
+            PanelEvent::CdHere { path } => {
+                let here = self.focused_source(cx).map(|(_, _, s, _)| s);
+                let same = match (&here, &self.files_source) {
+                    (Some(Source::Rex { machine: a, .. }), Some(Source::Rex { machine: b, .. })) => a == b,
+                    (Some(a), Some(b)) => a == b,
+                    _ => false,
+                };
+                let (Some(sid), Some(block)) = (self.sid(), self.focused_block.clone()) else { return };
+                if !same {
+                    self.banner = Some(t("The focused terminal is on another machine.", "当前终端在另一台机器上。").into());
+                    cx.notify();
+                    return;
+                }
+                self.send("client.key", json!({"session_id": sid, "block_id": block, "key": rexterm::rex::keys::text_key(&cd_command(path))}));
+                if let Some(enter) = to_rex_key(&KeyInput::new("enter")) {
+                    self.send("client.key", json!({"session_id": sid, "block_id": block, "key": enter}));
+                }
+                self.focus_terminal(window, cx);
+            }
+            PanelEvent::PickMachine(key) => {
+                let Some(m) = self.machine(key) else { return };
+                let source = source_for_machine(&m.spec, m.host_id.as_deref(), self.local_host_id().as_deref());
+                let (key, name) = (m.spec.key.clone(), m.spec.name.clone());
+                self.last_follow = None;
+                self.show_files(key, name, source, None, window, cx);
+            }
+            PanelEvent::Follow => {
+                self.last_follow = None;
+                self.follow(window, cx);
+            }
+        }
+    }
+
+    fn open_preview(&mut self, _path: String, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pinned = self.machines.first().is_some_and(|m| m.spec.key == "cli");
@@ -1758,7 +1920,9 @@ impl Render for Workspace {
         let conn = self.shown_machine().and_then(|m| m.conn.text().map(|s| format!("{}: {s}", m.spec.name)));
         let status = status_line(prefix, self.banner.as_deref(), conn.as_deref(), &self.notices);
         let main = div()
-            .size_full()
+            .flex_1()
+            .min_w_0()
+            .h_full()
             .flex()
             .flex_col()
             .bg(rgb(0x1e1e1e))
@@ -1785,7 +1949,22 @@ impl Render for Workspace {
             .size_full()
             .relative()
             .track_focus(&self.focus)
-            .child(SidebarLayout::new(&self.sidebar).sidebar(self.render_sidebar(cx)).child(main))
+            .child(
+                SidebarLayout::new(&self.sidebar).sidebar(self.render_sidebar(cx)).child(
+                    div().size_full().flex().child(main).when(self.files_open, |d| {
+                        d.child(
+                            div()
+                                .w(px(300.))
+                                .flex_none()
+                                .h_full()
+                                .border_l_1()
+                                .border_color(rgb(0x2a2a2a))
+                                .bg(rgb(0x1b1b1b))
+                                .child(self.files.clone()),
+                        )
+                    }),
+                ),
+            )
             .children(self.drag_overlay(cx))
             .children(self.render_modal(cx))
     }

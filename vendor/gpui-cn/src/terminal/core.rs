@@ -1,4 +1,4 @@
-// Changed for rexa-desktop (from gpui-cn 0.9.0, Apache-2.0): Core::from_snapshot, scrollback search.
+// Changed for rexa-desktop (from gpui-cn 0.9.0, Apache-2.0): Core::from_snapshot (with the reported folder), scrollback search.
 //! The Ghostty terminal, render state and encoders owned by one thread.
 //!
 //! `Core` turns bytes into [`TerminalFrame`]s and typed input into the bytes
@@ -329,7 +329,10 @@ impl Core {
             cell.cell_height(),
         )
         .ok_or_else(|| io::Error::other("snapshot grid out of range"))?;
-        Self::around(terminal, viewport, options, colors)
+        let mut core = Self::around(terminal, viewport, options, colors)?;
+        // The folder the program reported before the snapshot was taken.
+        core.cwd = core.terminal.pwd().ok().filter(|p| !p.is_empty()).and_then(reported_cwd);
+        Ok(core)
     }
 
     pub(crate) fn restore(
@@ -1227,6 +1230,16 @@ mod tests {
 
     fn searched(core: &mut Core) -> SearchFrame {
         core.frame(true).unwrap().unwrap().search.as_deref().cloned().expect("a search in the frame")
+    }
+
+    #[test]
+    fn snapshot_keeps_the_reported_folder() {
+        let mut a = sized(20, 4);
+        a.write(b"]7;file://h/tmp/a%20b\\", &mut Effects::default());
+        assert_eq!(a.cwd(), Some(&PathBuf::from("/tmp/a b")));
+        let bytes = vt::snapshot::encode(&a.terminal).unwrap().to_vec();
+        let b = Core::from_snapshot(&bytes, Viewport::new(20, 4, 8, 16).unwrap(), &EngineOptions::default(), TerminalColors::default()).unwrap();
+        assert_eq!(b.cwd(), Some(&PathBuf::from("/tmp/a b")));
     }
 
     #[test]
