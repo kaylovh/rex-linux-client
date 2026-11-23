@@ -1,6 +1,8 @@
 //! rexa-desktop: a desktop client for Rex.
 //!
 //!     rexa-desktop [-S ENDPOINT] [SESSION]
+//!
+//! Without -S it shows this computer and the machines in the settings; with -S only that one.
 
 mod config;
 mod i18n;
@@ -14,10 +16,13 @@ use gpui_kit::*;
 use rex_proto::transport::Endpoint;
 use rexterm::terminal::default_key_bindings;
 
+use crate::i18n::t;
+
 const USAGE: &str = "usage: rexa-desktop [-S ENDPOINT] [SESSION]\n";
 
 struct Args {
-    endpoint: Endpoint,
+    /// The -S text and what it names.
+    endpoint: Option<(String, Endpoint)>,
     session: Option<String>,
 }
 
@@ -29,7 +34,8 @@ fn parse_args() -> Result<Args, String> {
         match a.as_str() {
             "-S" | "--server" => {
                 let v = it.next().ok_or("-S needs an endpoint")?;
-                endpoint = Some(Endpoint::parse(&v).map_err(|e| e.to_string())?);
+                let ep = Endpoint::parse(&v).map_err(|e| e.to_string())?;
+                endpoint = Some((v, ep));
             }
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -39,7 +45,7 @@ fn parse_args() -> Result<Args, String> {
             _ => return Err(format!("unknown argument: {a}\n{USAGE}")),
         }
     }
-    Ok(Args { endpoint: endpoint.unwrap_or_else(Endpoint::default_local), session })
+    Ok(Args { endpoint, session })
 }
 
 fn main() {
@@ -50,7 +56,39 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let mut args = Some(args);
+    let dir = config::config_dir(|k| std::env::var(k).ok());
+    let (settings, broken) = match &dir {
+        Some(d) => config::load_settings(d),
+        None => (config::Settings::default(), None),
+    };
+    i18n::set_language(settings.language);
+    let state = dir.as_deref().map(config::load_state).unwrap_or_default();
+    let pinned = args.endpoint.is_some();
+    let (specs, mut notices) = machines::machine_specs(args.endpoint, &settings, Endpoint::default_local());
+    if let Some(why) = &broken {
+        notices.insert(
+            0,
+            format!(
+                "{} ({why}). {}",
+                t("The settings file can't be used", "设置文件无法使用"),
+                t("Using defaults; saving the settings replaces it and keeps the old one as settings.json.bak.", "暂用默认设置;在设置里保存会替换它,旧文件留作 settings.json.bak。")
+            ),
+        );
+    }
+    let start = machines::start_target(&specs, &state, args.session.as_deref());
+    let init = workspace::Init {
+        specs,
+        start,
+        strict: args.session.is_some(),
+        settings,
+        settings_broken: broken.is_some(),
+        config: dir,
+        // A machine pinned with -S isn't where the user left off.
+        save_state: !pinned,
+        state: state.clone(),
+        notices,
+    };
+    let mut init = Some(init);
     gpui_kit::application().with_assets(gpui_kit::assets::Assets).run(move |cx| {
         gpui_kit::init(cx);
         gpui_cn::init(cx);
@@ -61,15 +99,24 @@ fn main() {
             }
         })
         .detach();
-        let bounds = Bounds::centered(None, size(px(1200.), px(760.)), cx);
+        let (w, h) = state.window_size.unwrap_or((1200., 760.));
+        let bounds = Bounds::centered(None, size(px(w.max(480.)), px(h.max(320.))), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions { title: Some("rexa-desktop".into()), ..Default::default() }),
             app_id: Some("dev.rexa.Desktop".into()),
             ..Default::default()
         };
-        let Args { endpoint, session } = args.take().expect("run once");
-        gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| workspace::Workspace::new(endpoint, session, window, cx)))
-            .expect("failed to open window");
+        let init = init.take().expect("run once");
+        gpui_kit::open_window(options, cx, |window, cx| {
+            let ws = cx.new(|cx| workspace::Workspace::new(init, window, cx));
+            let w2 = ws.clone();
+            window.on_window_should_close(cx, move |window, cx| {
+                w2.read(cx).save_state(window, cx);
+                true
+            });
+            ws
+        })
+        .expect("failed to open window");
     });
 }

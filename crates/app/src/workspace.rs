@@ -1,7 +1,8 @@
-//! The window's content: a session sidebar, a tab per Rex window, the active window's panes
-//! laid out as the server says, and a status line.
+//! The window's content: a sidebar with every machine and its sessions, a tab per Rex window
+//! of the shown session, that window's panes laid out as the server says, and a status line.
 
 use std::cell::Cell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,14 +15,16 @@ use rex_client::layout::{Direction, WindowLayout, window_layout};
 use rex_client::model::{Effect, SessionInfo, SessionModel, Status};
 use rex_client::prefix::{Command, Dir, prefix_command};
 use rex_proto::control::Control;
-use rex_proto::transport::Endpoint;
 use rexterm::rex::{BlockRef, RexEvent, RexSource, attach, is_transient, keys::to_rex_key, recover};
 use rexterm::terminal::input::{KeyInput, Modifiers};
 use rexterm::terminal::{Terminal, TerminalConfig, TerminalState};
 use serde_json::{Value, json};
 
+use crate::config::{self, Settings, WorkspaceState};
 use crate::i18n::t;
 use crate::keys::gui_command;
+use crate::machines::{ConnState, MachineSpec};
+use crate::palette::session_name;
 use crate::panes::{PaneEntry, PaneSet, PaneStatus, diff};
 
 const SHELL: &str = "com.superlogical.terminal.shell";
@@ -30,42 +33,27 @@ fn shell_layout() -> Value {
     json!({"block": {"flavor": SHELL}})
 }
 
-struct Connected {
-    control: Arc<Control>,
-    sessions: Vec<SessionInfo>,
-    current: String,
-}
-
-/// Connects and picks the session: by label or id (an id suffix of 6+ characters works), else
-/// the first, else a new one. Blocks.
-fn connect(endpoint: Endpoint, wanted: Option<String>) -> Result<Connected, String> {
+/// Connects, lists the sessions and subscribes to every session's events. Blocks.
+fn connect(endpoint: rex_proto::transport::Endpoint) -> Result<(Arc<Control>, Vec<SessionInfo>), String> {
     let control = Control::connect(endpoint, "rexa-desktop").map_err(|e| e.to_string())?;
     let list = control.call("session.list", json!({})).map_err(|e| e.to_string())?;
-    let mut sessions: Vec<SessionInfo> = list["sessions"]
+    let sessions = list["sessions"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|s| Some(SessionInfo { id: s["session_id"].as_str()?.to_string(), label: s["label"].as_str().unwrap_or("").to_string() }))
         .collect();
-    let found = match &wanted {
-        Some(w) => sessions.iter().find(|s| &s.label == w || &s.id == w || (w.len() >= 6 && s.id.ends_with(w.as_str()))),
-        None => sessions.first(),
-    };
-    let current = match (found, &wanted) {
-        (Some(s), _) => s.id.clone(),
-        (None, Some(w)) => return Err(format!("{} \"{w}\"", t("no session matches", "没有匹配的 session"))),
-        (None, None) => {
-            let created = control
-                .call("session.create", json!({"initial_windows": [{"layout": shell_layout()}]}))
-                .map_err(|e| e.to_string())?;
-            let id = created["session_id"].as_str().unwrap_or_default().to_string();
-            sessions.push(SessionInfo { id: id.clone(), label: created["label"].as_str().unwrap_or("").to_string() });
-            id
-        }
-    };
-    // Every session's events (status dots for the sessions not shown too).
+    // Every session's events (status badges for the sessions not shown too).
     let _ = control.call("session.attach_all", json!({"event_scope": "all"}));
-    Ok(Connected { control, sessions, current })
+    Ok((control, sessions))
+}
+
+/// The session `wanted` names: by label or id (an id suffix of 6+ characters works).
+fn find_session(sessions: &[SessionInfo], wanted: &str) -> Option<String> {
+    sessions
+        .iter()
+        .find(|s| s.label == wanted || s.id == wanted || (wanted.len() >= 6 && s.id.ends_with(wanted)))
+        .map(|s| s.id.clone())
 }
 
 /// The program status records of every terminal block in every session, for the sidebar.
@@ -105,10 +93,49 @@ fn status_badge(s: Status) -> Option<&'static str> {
     }
 }
 
-pub struct Workspace {
-    endpoint: Endpoint,
+/// What the window starts with (from the command line, the settings and the saved state).
+pub struct Init {
+    pub specs: Vec<MachineSpec>,
+    /// The machine to show first and the session wanted there.
+    pub start: (String, Option<String>),
+    /// The session was named on the command line: not finding it is an error.
+    pub strict: bool,
+    pub settings: Settings,
+    pub settings_broken: bool,
+    /// None: don't save the workspace (no config dir, or a machine pinned with -S).
+    pub config: Option<PathBuf>,
+    pub save_state: bool,
+    pub state: WorkspaceState,
+    pub notices: Vec<String>,
+}
+
+/// One machine: its connection, its sessions and what their programs report.
+struct Machine {
+    spec: MachineSpec,
     control: Option<Arc<Control>>,
     model: SessionModel,
+    conn: ConnState,
+    tasks: Vec<Task<()>>,
+}
+
+/// Where to go once a machine connects. `machine` None: the first machine that connects.
+struct Start {
+    machine: Option<String>,
+    session: Option<String>,
+    strict: bool,
+}
+
+pub struct Workspace {
+    machines: Vec<Machine>,
+    /// The machine whose session is shown.
+    shown: Option<String>,
+    start: Option<Start>,
+    #[allow(dead_code)]
+    settings: Settings,
+    #[allow(dead_code)]
+    settings_broken: bool,
+    config: Option<PathBuf>,
+    save_enabled: bool,
     layout: WindowLayout,
     active_window: Option<String>,
     focused_block: Option<String>,
@@ -129,21 +156,13 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(endpoint: Endpoint, session: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(init: Init, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let tabs = cx.new(|_| TabsState::new([]));
-        let sidebar = cx.new(|cx| SidebarState::new(cx).with_width(px(220.)));
-        let mut tasks = Vec::new();
-        let ep = endpoint.clone();
-        tasks.push(cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move { connect(ep, session) }).await;
-            let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(c) => this.connected(c, window, cx),
-                Err(why) => {
-                    this.banner = Some(format!("{}{why}", t("Can't connect: ", "连不上:")));
-                    cx.notify();
-                }
-            });
-        }));
+        let st = &init.state;
+        let sidebar = cx.new(|cx| {
+            let s = SidebarState::new(cx).with_width(px(st.sidebar_width.unwrap_or(220.).clamp(140., 600.)));
+            if st.sidebar_open { s } else { s.closed() }
+        });
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let this = cx.weak_entity();
@@ -152,71 +171,231 @@ impl Workspace {
                 w.update(cx, |w, cx| w.on_keystroke(ev, window, cx));
             }
         });
-        let me = Self {
-            endpoint,
-            control: None,
-            model: SessionModel::default(),
+        let banner = (!init.notices.is_empty()).then(|| init.notices.join(" · "));
+        let mut me = Self {
+            machines: init
+                .specs
+                .into_iter()
+                .map(|spec| Machine { spec, control: None, model: SessionModel::default(), conn: ConnState::Connecting, tasks: Vec::new() })
+                .collect(),
+            shown: None,
+            start: Some(Start { machine: Some(init.start.0), session: init.start.1, strict: init.strict }),
+            settings: init.settings,
+            settings_broken: init.settings_broken,
+            config: init.config,
+            save_enabled: init.save_state,
             layout: WindowLayout::default(),
             active_window: None,
             focused_block: None,
             panes: PaneSet::default(),
             tabs: tabs.clone(),
             sidebar,
-            banner: Some(t("Connecting…", "正在连接…").into()),
+            banner,
             prefix: false,
             area: Rc::new(Cell::new(Bounds::default())),
             drag: None,
             focus,
             _subs: vec![key_sub],
             fetching_view: false,
-            tasks,
+            tasks: Vec::new(),
         };
         cx.subscribe_in(&tabs, window, Self::on_tab_event).detach();
+        let keys: Vec<String> = me.machines.iter().map(|m| m.spec.key.clone()).collect();
+        for k in keys {
+            me.connect_machine(k, window, cx);
+        }
         me
     }
 
+    // ---- machines ---------------------------------------------------------------------
+
+    fn machine(&self, key: &str) -> Option<&Machine> {
+        self.machines.iter().find(|m| m.spec.key == key)
+    }
+
+    fn machine_mut(&mut self, key: &str) -> Option<&mut Machine> {
+        self.machines.iter_mut().find(|m| m.spec.key == key)
+    }
+
+    fn shown_machine(&self) -> Option<&Machine> {
+        self.machine(self.shown.as_deref()?)
+    }
+
+    fn shown_mut(&mut self) -> Option<&mut Machine> {
+        let k = self.shown.clone()?;
+        self.machine_mut(&k)
+    }
+
     fn control(&self) -> Option<Arc<Control>> {
-        self.control.clone()
+        self.shown_machine()?.control.clone()
     }
 
     fn sid(&self) -> Option<String> {
-        self.model.current.clone()
+        self.shown_machine()?.model.current.clone()
+    }
+
+    fn view(&self) -> Option<&Value> {
+        self.shown_machine()?.model.view.as_ref()
     }
 
     fn send(&self, method: &str, payload: Value) {
-        if let Some(c) = &self.control {
+        if let Some(c) = self.control() {
             c.send(method, payload);
         }
     }
 
-    fn connected(&mut self, c: Connected, window: &mut Window, cx: &mut Context<Self>) {
-        self.banner = None;
-        self.model.sessions = c.sessions.clone();
-        self.control = Some(c.control.clone());
-        self.watch_events(c.control.clone(), window, cx);
-        // Status dots for every session, in the background.
-        let (control, sessions) = (c.control.clone(), c.sessions);
-        self.tasks.push(cx.spawn_in(window, async move |this, cx| {
-            let records = cx.background_spawn(async move { initial_status(&control, &sessions) }).await;
-            let _ = this.update(cx, |this, cx| {
-                for (sid, bid, rid, st) in records {
-                    this.model.set_status(&sid, &bid, rid, st);
-                }
-                cx.notify();
-            });
-        }));
-        self.open_session(c.current, window, cx);
+    /// (Re)connects a machine in the background.
+    fn connect_machine(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(m) = self.machine_mut(&key) else { return };
+        m.conn = ConnState::Connecting;
+        m.tasks.clear();
+        if let Some(old) = m.control.take() {
+            old.close();
+        }
+        let endpoint = m.spec.endpoint.clone();
+        let k = key.clone();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(async move { connect(endpoint) }).await;
+            let _ = this.update_in(cx, |this, window, cx| this.machine_connected(&k, result, window, cx));
+        });
+        if let Some(m) = self.machine_mut(&key) {
+            m.tasks.push(task);
+        }
+        cx.notify();
     }
 
-    /// Attaches `sid` and shows it (the caller has left the old one).
+    fn machine_connected(
+        &mut self,
+        key: &str,
+        result: Result<(Arc<Control>, Vec<SessionInfo>), String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(m) = self.machine_mut(key) else { return };
+        match result {
+            Err(why) => {
+                m.conn = ConnState::Failed(why.clone());
+                // The machine to start on can't be reached: start on the first that can.
+                if let Some(s) = &mut self.start
+                    && s.machine.as_deref() == Some(key)
+                {
+                    if s.strict {
+                        self.banner = Some(format!("{}{why}", t("Can't connect: ", "连不上:")));
+                        self.start = None;
+                    } else {
+                        s.machine = None;
+                        s.session = None;
+                        let first = self.machines.iter().find(|m| m.conn == ConnState::Connected).map(|m| m.spec.key.clone());
+                        if let Some(k) = first {
+                            self.maybe_start(&k, window, cx);
+                        }
+                    }
+                }
+            }
+            Ok((control, sessions)) => {
+                m.conn = ConnState::Connected;
+                m.model = SessionModel::default();
+                m.model.sessions = sessions.clone();
+                m.control = Some(control.clone());
+                let events = control.events();
+                let k = key.to_string();
+                m.tasks.push(cx.spawn_in(window, async move |this, cx| {
+                    while let Ok(ev) = events.recv().await {
+                        if this.update_in(cx, |this, window, cx| this.on_server_event(&k, ev, window, cx)).is_err() {
+                            break;
+                        }
+                    }
+                }));
+                // Status badges for every session, in the background.
+                let k = key.to_string();
+                m.tasks.push(cx.spawn_in(window, async move |this, cx| {
+                    let records = cx.background_spawn(async move { initial_status(&control, &sessions) }).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(m) = this.machine_mut(&k) {
+                            for (sid, bid, rid, st) in records {
+                                m.model.set_status(&sid, &bid, rid, st);
+                            }
+                        }
+                        cx.notify();
+                    });
+                }));
+                self.maybe_start(key, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Opens the first session once the start machine (or, after it failed, any machine) is
+    /// connected: the wanted one, else the first, else a new one.
+    fn maybe_start(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shown.is_some() {
+            self.start = None;
+            return;
+        }
+        let Some(start) = &self.start else { return };
+        if start.machine.as_deref().is_some_and(|m| m != key) {
+            return;
+        }
+        let Some(m) = self.machine(key) else { return };
+        let wanted = start.session.as_deref().and_then(|w| find_session(&m.model.sessions, w));
+        let strict = start.strict;
+        let missing = start.session.clone().filter(|_| wanted.is_none());
+        let first = m.model.sessions.first().map(|s| s.id.clone());
+        self.start = None;
+        match (wanted, missing) {
+            (Some(id), _) => self.open(key.to_string(), id, window, cx),
+            (None, Some(w)) if strict => {
+                self.banner = Some(format!("{} \"{w}\"", t("no session matches", "没有匹配的 session")));
+            }
+            _ => match first {
+                Some(id) => self.open(key.to_string(), id, window, cx),
+                None => self.new_session(key.to_string(), window, cx),
+            },
+        }
+    }
+
+    // ---- sessions ---------------------------------------------------------------------
+
+    /// Shows `sid` of machine `key`, leaving whatever was shown.
+    fn open(&mut self, key: String, sid: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shown.as_deref() == Some(key.as_str()) && self.sid().as_deref() == Some(sid.as_str()) {
+            return;
+        }
+        self.leave(window, cx);
+        self.shown = Some(key);
+        self.open_session(sid, window, cx);
+        self.save_state(window, cx);
+    }
+
+    /// Detaches the shown session and closes its panes.
+    fn leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let old = self.shown_mut().and_then(|m| {
+            m.model.view = None;
+            m.model.reset_announced();
+            m.model.current.take().map(|s| (m.control.clone(), s))
+        });
+        if let Some((Some(c), s)) = old {
+            c.send("session.detach", json!({"session_id": s}));
+        }
+        self.reconcile_panes(&[], window, cx);
+        self.layout = WindowLayout::default();
+        self.active_window = None;
+        self.focused_block = None;
+        self.fetching_view = false;
+    }
+
+    /// Attaches `sid` on the shown machine and shows it (the caller has left the old one).
     fn open_session(&mut self, sid: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(control) = self.control() else { return };
-        self.model.current = Some(sid.clone());
-        self.model.view = None;
-        self.model.reset_announced();
+        let Some(m) = self.shown_mut() else { return };
+        m.model.current = Some(sid.clone());
+        m.model.view = None;
+        m.model.reset_announced();
+        let label = m.model.sessions.iter().find(|s| s.id == sid).map(|s| session_name(&s.id, &s.label)).unwrap_or_default();
+        let machine = m.spec.name.clone();
         self.active_window = None;
-        let label = self.model.sessions.iter().find(|s| s.id == sid).map(|s| s.label.clone()).unwrap_or_default();
-        window.set_window_title(&format!("rexa-desktop — {label}"));
+        self.banner = None;
+        window.set_window_title(&format!("rexa-desktop — {machine} / {label}"));
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
             let c2 = control.clone();
             let s2 = sid.clone();
@@ -232,14 +411,24 @@ impl Workspace {
     }
 
     fn switch_session(&mut self, sid: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(old) = self.sid() else { return };
-        if old == sid {
-            return;
+        if let Some(k) = self.shown.clone() {
+            self.open(k, sid, window, cx);
         }
-        self.send("session.detach", json!({"session_id": old}));
-        self.reconcile_panes(&[], window, cx);
-        self.layout = WindowLayout::default();
-        self.open_session(sid, window, cx);
+    }
+
+    /// Writes which machine and session are shown, the sidebar and the window size.
+    pub fn save_state(&self, window: &Window, cx: &App) {
+        let (Some(dir), true) = (&self.config, self.save_enabled) else { return };
+        let sb = self.sidebar.read(cx);
+        let size = window.bounds().size;
+        let state = WorkspaceState {
+            machine: self.shown.clone(),
+            session: self.sid(),
+            sidebar_open: sb.is_open(),
+            sidebar_width: Some(f32::from(sb.width())),
+            window_size: Some((f32::from(size.width), f32::from(size.height))),
+        };
+        let _ = config::save_state(dir, &state);
     }
 
     fn refetch_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -256,7 +445,7 @@ impl Workspace {
                     this.apply_view(v, window, cx);
                 }
                 // A change announced while this fetch ran may not be in it.
-                if this.model.needs_refetch() {
+                if this.shown_machine().is_some_and(|m| m.model.needs_refetch()) {
                     this.refetch_view(window, cx);
                 }
             });
@@ -264,7 +453,7 @@ impl Workspace {
     }
 
     fn apply_view(&mut self, view: Value, window: &mut Window, cx: &mut Context<Self>) {
-        if view["session_id"].as_str() != self.sid().as_deref() || !self.model.set_view(view.clone()) {
+        if view["session_id"].as_str() != self.sid().as_deref() || !self.shown_mut().is_some_and(|m| m.model.set_view(view.clone())) {
             return;
         }
         let active = view["active_window_id"].as_str().map(str::to_string);
@@ -331,7 +520,7 @@ impl Workspace {
     fn on_tab_event(&mut self, _tabs: &Entity<TabsState>, ev: &TabsEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(sid) = self.sid() else { return };
         let in_view = |id: &str| {
-            self.model.view.as_ref().is_some_and(|v| v["windows"].as_array().into_iter().flatten().any(|w| w["window_id"] == id))
+            self.view().is_some_and(|v| v["windows"].as_array().into_iter().flatten().any(|w| w["window_id"] == id))
         };
         match ev {
             // Only a selection the strip still shows: removing tabs during a sync emits
@@ -346,7 +535,7 @@ impl Workspace {
             TabsEvent::AddRequested => self.run(Command::NewTab, window, cx),
             TabsEvent::Renamed(id) if in_view(id) => {
                 let label = self.tabs.read(cx).tabs().iter().find(|t| t.id() == id).map(|t| t.label().to_string());
-                let current = self.model.view.as_ref().and_then(|v| {
+                let current = self.view().and_then(|v| {
                     v["windows"].as_array()?.iter().find(|w| w["window_id"] == id.as_ref())?["label"].as_str().map(str::to_string)
                 });
                 if let Some(l) = label
@@ -397,7 +586,7 @@ impl Workspace {
     // ---- panes --------------------------------------------------------------------
 
     fn block_ref(&self, block_id: &str) -> Option<BlockRef> {
-        Some(BlockRef { endpoint: self.endpoint.clone(), control: self.control()?, session_id: self.sid()?, block_id: block_id.to_string() })
+        Some(BlockRef { endpoint: self.shown_machine()?.spec.endpoint.clone(), control: self.control()?, session_id: self.sid()?, block_id: block_id.to_string() })
     }
 
     fn reconcile_panes(&mut self, wanted: &[String], window: &mut Window, cx: &mut Context<Self>) {
@@ -517,60 +706,62 @@ impl Workspace {
             }
         }
         // The new client is attached again by the first recover; read the view afresh.
-        self.model.view = None;
+        if let Some(m) = self.shown_mut() {
+            m.model.view = None;
+        }
         let _ = sid;
         self.refetch_view(window, cx);
     }
 
     // ---- events ---------------------------------------------------------------------
 
-    fn watch_events(&mut self, control: Arc<Control>, window: &mut Window, cx: &mut Context<Self>) {
-        let events = control.events();
-        self.tasks.push(cx.spawn_in(window, async move |this, cx| {
-            while let Ok(ev) = events.recv().await {
-                if this.update_in(cx, |this, window, cx| this.on_server_event(ev, window, cx)).is_err() {
-                    break;
-                }
-            }
-        }));
-    }
-
-    fn on_server_event(&mut self, ev: Value, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_server_event(&mut self, key: &str, ev: Value, window: &mut Window, cx: &mut Context<Self>) {
+        let shown = self.shown.as_deref() == Some(key);
+        let Some(m) = self.machine_mut(key) else { return };
         match ev["type"].as_str() {
-            Some("rexa_reconnecting") => self.banner = Some(t("Reconnecting…", "正在重连…").into()),
+            Some("rexa_reconnecting") => m.conn = ConnState::Reconnecting,
             Some("rexa_reconnected") => {
-                self.banner = None;
+                m.conn = ConnState::Connected;
                 if ev["resumed"] != true {
                     // A new client: attach everything again.
-                    if let Some(c) = self.control() {
+                    if let Some(c) = m.control.clone() {
                         cx.background_spawn(async move {
                             let _ = c.call("session.attach_all", json!({"event_scope": "all"}));
                         })
                         .detach();
                     }
-                    self.recover_all(window, cx);
+                    if shown {
+                        self.recover_all(window, cx);
+                    }
                 }
             }
-            Some("rexa_disconnected") => self.banner = Some(t("Disconnected", "连接已断开").into()),
-            _ => match self.model.apply_event(&ev) {
-                Effect::RefetchView(_) => self.refetch_view(window, cx),
-                Effect::SessionsChanged => {
-                    if let Some(cur) = self.sid()
-                        && !self.model.sessions.iter().any(|s| s.id == cur)
+            Some("rexa_disconnected") => m.conn = ConnState::Failed(t("disconnected", "连接已断开").into()),
+            _ => match m.model.apply_event(&ev) {
+                Effect::RefetchView(_) if shown => self.refetch_view(window, cx),
+                Effect::SessionsChanged if shown => {
+                    if let Some(cur) = m.model.current.clone()
+                        && !m.model.sessions.iter().any(|s| s.id == cur)
                     {
-                        // The shown session was destroyed: show another, if any.
+                        // The shown session was destroyed: show another of this machine, if any.
+                        let next = m.model.sessions.first().map(|s| s.id.clone());
+                        m.model.current = None;
+                        m.model.view = None;
                         self.reconcile_panes(&[], window, cx);
                         self.layout = WindowLayout::default();
-                        match self.model.sessions.first().map(|s| s.id.clone()) {
-                            Some(next) => self.open_session(next, window, cx),
+                        self.active_window = None;
+                        self.focused_block = None;
+                        match next {
+                            Some(next) => {
+                                self.open_session(next, window, cx);
+                                self.save_state(window, cx);
+                            }
                             None => {
-                                self.model.current = None;
                                 self.banner = Some(t("No sessions. Press Ctrl-b N for a new one.", "没有 session。按 Ctrl-b N 新建。").into());
                             }
                         }
                     }
                 }
-                Effect::StatusChanged | Effect::Nothing => {}
+                _ => {}
             },
         }
         cx.notify();
@@ -581,7 +772,10 @@ impl Workspace {
     fn run(&mut self, cmd: Command, window: &mut Window, cx: &mut Context<Self>) {
         let Some(sid) = self.sid() else {
             if cmd == Command::NewSession {
-                self.new_session(window, cx);
+                let first = self.shown.clone().or_else(|| self.machines.iter().find(|m| m.conn == ConnState::Connected).map(|m| m.spec.key.clone()));
+                if let Some(k) = first {
+                    self.new_session(k, window, cx);
+                }
             }
             return;
         };
@@ -591,7 +785,7 @@ impl Workspace {
             Command::NextTab => self.send("session.focus_next_window", json!({"session_id": sid})),
             Command::PrevTab => self.send("session.focus_previous_window", json!({"session_id": sid})),
             Command::Tab(i) => {
-                let wid = self.model.view.as_ref().and_then(|v| v["windows"].get(i as usize)?["window_id"].as_str().map(str::to_string));
+                let wid = self.view().and_then(|v| v["windows"].get(i as usize)?["window_id"].as_str().map(str::to_string));
                 if let Some(w) = wid {
                     self.send("session.focus_window", json!({"session_id": sid, "window_id": w}));
                 }
@@ -632,20 +826,30 @@ impl Workspace {
                 }
             }
             Command::PrevSession | Command::NextSession => {
-                let ids: Vec<String> = self.model.sessions.iter().map(|s| s.id.clone()).collect();
+                let ids: Vec<String> = self.shown_machine().map(|m| m.model.sessions.iter().map(|s| s.id.clone()).collect()).unwrap_or_default();
                 if let Some(i) = ids.iter().position(|s| *s == sid) {
                     let n = ids.len();
                     let j = if cmd == Command::NextSession { (i + 1) % n } else { (i + n - 1) % n };
                     self.switch_session(ids[j].clone(), window, cx);
                 }
             }
-            Command::NewSession => self.new_session(window, cx),
+            Command::NewSession => {
+                if let Some(k) = self.shown.clone() {
+                    self.new_session(k, window, cx);
+                }
+            }
             // Renaming sessions comes with the M2b palette/settings work.
             Command::RenameSession => {}
             // Wired with the dialogs.
             Command::Palette | Command::Settings | Command::CloseSession => {}
-            Command::ToggleSidebar => self.sidebar.update(cx, |s, cx| s.toggle(cx)),
-            Command::Quit => cx.quit(),
+            Command::ToggleSidebar => {
+                self.sidebar.update(cx, |s, cx| s.toggle(cx));
+                self.save_state(window, cx);
+            }
+            Command::Quit => {
+                self.save_state(window, cx);
+                cx.quit();
+            }
             Command::SendPrefix => {
                 if let Some(b) = focused {
                     let mut m = Modifiers::default();
@@ -658,26 +862,30 @@ impl Workspace {
         }
     }
 
-    fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(control) = self.control() else { return };
+    fn new_session(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(control) = self.machine(&key).and_then(|m| m.control.clone()) else { return };
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
             let created = cx
                 .background_spawn(async move { control.call("session.create", json!({"initial_windows": [{"layout": shell_layout()}]})) })
                 .await;
-            if let Ok(c) = created
-                && let Some(id) = c["session_id"].as_str().map(str::to_string)
-            {
-                let _ = this.update_in(cx, |this, window, cx| {
-                    if !this.model.sessions.iter().any(|s| s.id == id) {
-                        this.model.sessions.push(SessionInfo { id: id.clone(), label: c["label"].as_str().unwrap_or("").to_string() });
-                    }
-                    if this.sid().is_some() {
-                        this.switch_session(id, window, cx);
-                    } else {
-                        this.banner = None;
-                        this.open_session(id, window, cx);
-                    }
-                });
+            match created {
+                Ok(c) => {
+                    let Some(id) = c["session_id"].as_str().map(str::to_string) else { return };
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        if let Some(m) = this.machine_mut(&key)
+                            && !m.model.sessions.iter().any(|s| s.id == id)
+                        {
+                            m.model.sessions.push(SessionInfo { id: id.clone(), label: c["label"].as_str().unwrap_or("").to_string() });
+                        }
+                        this.open(key, id, window, cx);
+                    });
+                }
+                Err(e) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.banner = Some(format!("{}{e}", t("Can't create a session: ", "无法新建 session:")));
+                        cx.notify();
+                    });
+                }
             }
         }));
     }
@@ -710,28 +918,44 @@ impl Workspace {
     // ---- drawing ----------------------------------------------------------------------
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> Sidebar {
-        let current = self.sid();
-        let mut group = SidebarGroup::new().label(t("Sessions", "Session"));
-        for s in &self.model.sessions {
-            let id = s.id.clone();
-            let label = if s.label.is_empty() { s.id.chars().rev().take(6).collect::<String>().chars().rev().collect() } else { s.label.clone() };
-            let mut button = SidebarMenuButton::new(SharedString::from(format!("session-{}", s.id)))
-                .label(label)
-                .selected(current.as_deref() == Some(s.id.as_str()))
-                .on_click(cx.listener(move |this, _, window, cx| this.switch_session(id.clone(), window, cx)));
-            if let Some(b) = status_badge(self.model.session_status(&s.id)) {
-                button = button.badge(b);
+        let mut bar = Sidebar::new();
+        for m in &self.machines {
+            let key = m.spec.key.clone();
+            let mut group = SidebarGroup::new().id(SharedString::from(format!("machine-{key}"))).label(match m.conn.text() {
+                Some(s) => format!("{} · {s}", m.spec.name),
+                None => m.spec.name.clone(),
+            });
+            if matches!(m.conn, ConnState::Failed(_)) {
+                let k = key.clone();
+                group = group.child(
+                    SidebarMenuButton::new(SharedString::from(format!("retry-{key}")))
+                        .label(t("Retry", "重试"))
+                        .on_click(cx.listener(move |this, _, window, cx| this.connect_machine(k.clone(), window, cx))),
+                );
             }
-            group = group.child(button);
+            let shown = self.shown.as_deref() == Some(key.as_str());
+            for s in &m.model.sessions {
+                let (k, id) = (key.clone(), s.id.clone());
+                let mut button = SidebarMenuButton::new(SharedString::from(format!("session-{key}-{}", s.id)))
+                    .label(session_name(&s.id, &s.label))
+                    .selected(shown && m.model.current.as_deref() == Some(s.id.as_str()))
+                    .on_click(cx.listener(move |this, _, window, cx| this.open(k.clone(), id.clone(), window, cx)));
+                if let Some(b) = status_badge(m.model.session_status(&s.id)) {
+                    button = button.badge(b);
+                }
+                group = group.child(button);
+            }
+            if m.conn == ConnState::Connected {
+                let k = key.clone();
+                group = group.child(
+                    SidebarMenuButton::new(SharedString::from(format!("new-session-{key}")))
+                        .label(t("+ New session", "+ 新建 session"))
+                        .on_click(cx.listener(move |this, _, window, cx| this.new_session(k.clone(), window, cx))),
+                );
+            }
+            bar = bar.child(group);
         }
-        Sidebar::new()
-            .header(div().px_2().py_1().text_sm().child(t("This computer", "本机")))
-            .child(group)
-            .footer(
-                SidebarMenuButton::new("new-session")
-                    .label(t("+ New session", "+ 新建 session"))
-                    .on_click(cx.listener(|this, _, window, cx| this.new_session(window, cx))),
-            )
+        bar
     }
 
     fn pane_cell(&self, p: &rex_client::layout::Pane, cx: &mut Context<Self>) -> Div {
