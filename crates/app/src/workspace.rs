@@ -13,7 +13,7 @@ use gpui_cn::{
 };
 use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::assets::IconName;
-use gpui_kit::base::Selectable as _;
+use gpui_kit::base::{Disableable as _, Selectable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rex_client::layout::{Direction, WindowLayout, window_layout};
@@ -33,6 +33,11 @@ use crate::machines::{ConnState, MachineSpec, StartChoice, after_reconnect, star
 use crate::palette::{PaletteAction, PaletteEntry, PaletteSession, palette_entries, session_name};
 use crate::file_panel::{FilePanel, PanelEvent};
 use crate::preview::{PreviewEvent, PreviewPanel};
+use crate::transfers::{Direction as XferDirection, NewTransfer, Queue, State as XferState, TransferId};
+use files::transfer::{CopyError, ItemKind, Progress as XferProgress, copy_file, copy_tree, plan_tree, unique_name};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use crate::locate::{Source, cd_command, restorable, source_for_block, source_for_machine, source_tag};
 use crate::machines::machine_specs;
 use crate::panes::{PaneEntry, PaneSet, PaneStatus, diff};
@@ -153,8 +158,57 @@ enum Modal {
     Settings { view: Entity<SettingsView>, _sub: Subscription },
     /// What one machine's Rex server says about itself; rows None while loading.
     ServerInfo { machine: String, rows: Option<Vec<(String, String)>>, message: Option<String> },
+    /// Where an upload or a download goes.
+    Transfer { req: TransferReq, folder: Entity<InputState>, target: Option<String> },
     /// The search bar over one pane.
     Search { block: String, input: Entity<InputState>, _sub: Subscription },
+}
+
+/// What the transfer dialog is about: the items and where they come from.
+#[derive(Clone)]
+struct TransferReq {
+    direction: XferDirection,
+    sources: Vec<String>,
+    src_machine: String,
+    src_fs: Arc<dyn files::FileSystem>,
+}
+
+/// What to do with names already at the target.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnConflict {
+    Overwrite,
+    KeepBoth,
+    Skip,
+}
+
+/// Copies one transfer's item (a file, or a folder and what is in it). Blocks.
+fn run_transfer(
+    src: &dyn files::FileSystem,
+    dst: &dyn files::FileSystem,
+    job: &NewTransfer,
+    resume: bool,
+    progress: &Mutex<(u64, u64)>,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    let plan = plan_tree(src, &job.src_path).map_err(|e| crate::file_panel::fs_error_text(&e))?;
+    let mut on = |p: XferProgress| {
+        *progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = (p.done, p.total);
+        !stop.load(Ordering::SeqCst)
+    };
+    let to = files::join(&job.dst_dir, &job.dst_name);
+    let result = match plan.items.first() {
+        Some(i) if plan.items.len() == 1 && i.kind == ItemKind::File => copy_file(src, &job.src_path, dst, &to, resume, job.overwrite, &mut on).map(|_| ()),
+        _ => copy_tree(src, &job.src_path, dst, &job.dst_dir, &job.dst_name, &plan, job.overwrite, &mut on).map(|_| ()),
+    };
+    result.map_err(|e| match e {
+        CopyError::Canceled => t("Canceled", "已取消").to_string(),
+        CopyError::Exists => t("Something with that name is already there.", "目标位置已有同名文件或文件夹。").to_string(),
+        CopyError::Fs(e) => crate::file_panel::fs_error_text(&e),
+    })
+}
+
+fn human(n: u64) -> String {
+    crate::preview::human_size(n)
 }
 
 /// Where to go once a machine connects. `machine` None: the first machine that connects.
@@ -196,6 +250,15 @@ pub struct Workspace {
     _subs: Vec<Subscription>,
     fetching_view: bool,
     modal: Modal,
+    transfers: Queue,
+    transfers_open: bool,
+    /// Each transfer's source and target file systems (kept for Retry).
+    transfer_fs: std::collections::HashMap<TransferId, (Arc<dyn files::FileSystem>, Arc<dyn files::FileSystem>)>,
+    /// Running transfers: progress (done, total) and the stop flag.
+    transfer_runs: std::collections::HashMap<TransferId, (Arc<Mutex<(u64, u64)>>, Arc<AtomicBool>)>,
+    transfer_tick: Option<Task<()>>,
+    /// Quitting was confirmed with transfers running.
+    quit_with_transfers: bool,
     files: Entity<FilePanel>,
     files_open: bool,
     /// Restored once their machine connects: the pinned folder, the open previews.
@@ -295,6 +358,12 @@ impl Workspace {
             _subs: vec![key_sub],
             fetching_view: false,
             modal: Modal::None,
+            transfers: Queue::default(),
+            transfers_open: false,
+            transfer_fs: std::collections::HashMap::new(),
+            transfer_runs: std::collections::HashMap::new(),
+            transfer_tick: None,
+            quit_with_transfers: false,
             files,
             files_open: files_state.open,
             pending_pin: files_state.pinned,
@@ -551,6 +620,29 @@ impl Workspace {
     /// Whether the window can close now; with unsaved files, asks Save all / Discard / Cancel
     /// first and says no (the answer finishes the close).
     pub fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.transfers.active() > 0 && !self.quit_with_transfers {
+            let answer = window.prompt(
+                PromptLevel::Warning,
+                t("Transfers are still running.", "还有传输在进行。"),
+                Some(t("Stopping them keeps nothing half-copied under its final name; Retry later starts them again.", "停止后不会留下改了正式名字的半截文件;以后可以重试。")),
+                &[PromptButton::Ok(t("Stop and quit", "停止并退出").into()), PromptButton::Cancel(t("Cancel", "取消").into())],
+                cx,
+            );
+            self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+                if answer.await == Ok(0) {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.quit_with_transfers = true;
+                        for (_, stop) in this.transfer_runs.values() {
+                            stop.store(true, Ordering::SeqCst);
+                        }
+                        if this.request_close(window, cx) {
+                            cx.quit();
+                        }
+                    });
+                }
+            }));
+            return false;
+        }
         let names = self.preview.read(cx).dirty_names();
         if names.is_empty() {
             self.save_state(window, cx);
@@ -1011,6 +1103,11 @@ impl Workspace {
                 self.preview.update(cx, |p, cx| p.save_active(window, cx));
                 return;
             }
+            Command::ToggleTransfers => {
+                self.transfers_open = !self.transfers_open;
+                cx.notify();
+                return;
+            }
             Command::ToggleFiles => {
                 self.files_open = !self.files_open;
                 self.last_follow = None;
@@ -1114,7 +1211,7 @@ impl Workspace {
             }
             Command::Palette | Command::Settings => {}
             Command::Search => self.open_search(window, cx),
-            Command::ServerInfo | Command::ToggleFiles | Command::Save => {}
+            Command::ServerInfo | Command::ToggleFiles | Command::Save | Command::ToggleTransfers => {}
             Command::ToggleSidebar => {
                 self.sidebar.update(cx, |s, cx| s.toggle(cx));
                 self.save_state(window, cx);
@@ -1548,6 +1645,23 @@ impl Workspace {
                 self.preview.update(cx, |p, cx| p.open_new(machine, tag, path.clone(), fs, window, cx));
                 cx.notify();
             }
+            PanelEvent::Upload { dir } => {
+                let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: true, multiple: true, prompt: Some(t("Upload", "上传").into()) });
+                let dir = dir.clone();
+                self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+                    if let Ok(Ok(Some(paths))) = picked.await {
+                        let _ = this.update_in(cx, |this, window, cx| this.open_upload(paths, dir, window, cx));
+                    }
+                }));
+            }
+            PanelEvent::Dropped { paths, dir } => self.open_upload(paths.clone(), dir.clone(), window, cx),
+            PanelEvent::Download { path } => {
+                let panel = self.files.read(cx);
+                let (Some(machine), Some(fs)) = (panel.machine().map(str::to_string), panel.fs()) else { return };
+                let req = TransferReq { direction: XferDirection::Download, sources: vec![path.clone()], src_machine: machine, src_fs: fs };
+                let dir = config::download_dir(&self.settings, |k| std::env::var(k).ok()).unwrap_or_default();
+                self.open_transfer(req, dir, None, window, cx);
+            }
             PanelEvent::Retry => {
                 self.last_follow = None;
                 let pinned = self.files.read(cx).pinned();
@@ -1657,6 +1771,321 @@ impl Workspace {
                 _ => {}
             }
         }
+    }
+
+    // ---- transfers ------------------------------------------------------------------
+
+    fn open_upload(&mut self, paths: Vec<std::path::PathBuf>, dir: String, window: &mut Window, cx: &mut Context<Self>) {
+        let src_machine = self.machines.iter().find(|m| m.spec.local).map(|m| m.spec.key.clone()).unwrap_or_else(|| "local".into());
+        let sources = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let req = TransferReq { direction: XferDirection::Upload, sources, src_machine, src_fs: self.local_fs.clone() };
+        let target = self.files.read(cx).machine().map(str::to_string);
+        self.open_transfer(req, dir, target, window, cx);
+    }
+
+    fn open_transfer(&mut self, req: TransferReq, dir: String, target: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let folder = cx.new(|cx| InputState::new(window, cx).default_value(dir));
+        self.set_modal(Modal::Transfer { req, folder, target }, cx);
+    }
+
+    /// Machines an upload can go to: ones whose files are writable from here.
+    fn upload_targets(&self, cx: &App) -> Vec<(String, String)> {
+        let local = self.local_host_id();
+        let panel = self.files.read(cx);
+        self.machines
+            .iter()
+            .filter(|m| {
+                let writable = matches!(source_for_machine(&m.spec, m.host_id.as_deref(), local.as_deref()), Source::Local | Source::Sftp { .. });
+                writable || (panel.machine() == Some(m.spec.key.as_str()) && matches!(self.files_source, Some(Source::Local | Source::Sftp { .. })))
+            })
+            .map(|m| (m.spec.key.clone(), m.spec.name.clone()))
+            .collect()
+    }
+
+    /// The file system for writing to machine `key`: the panel's if it shows that machine
+    /// writably, else this computer's or an ssh machine's (connecting if needed).
+    fn writable_fs(&mut self, key: &str, cx: &App) -> Option<Result<Arc<dyn files::FileSystem>, String>> {
+        let panel = self.files.read(cx);
+        if panel.machine() == Some(key)
+            && matches!(self.files_source, Some(Source::Local | Source::Sftp { .. }))
+            && let Some(fs) = panel.fs()
+        {
+            return Some(Ok(fs));
+        }
+        let m = self.machine(key)?;
+        match source_for_machine(&m.spec, m.host_id.as_deref(), self.local_host_id().as_deref()) {
+            Source::Local => Some(Ok(self.local_fs.clone())),
+            Source::Sftp { address } => self.sftp.get(&address).cloned().map(Ok).or_else(|| {
+                let argv = rex_proto::transport::sftp_command(&address)?;
+                Some(files::sftp::SftpFs::spawn(argv).map(|s| Arc::new(s) as Arc<dyn files::FileSystem>).map_err(|e| crate::file_panel::fs_error_text(&e)))
+            }),
+            _ => None,
+        }
+    }
+
+    /// The dialog's Start: resolve the target, look for names already there, ask, queue.
+    fn start_transfer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Modal::Transfer { req, folder, target } = std::mem::replace(&mut self.modal, Modal::None) else { return };
+        let dir = folder.read(cx).value().trim().to_string();
+        cx.notify();
+        if dir.is_empty() {
+            return;
+        }
+        let (dst_machine, dst_fs) = match req.direction {
+            XferDirection::Upload => {
+                let Some(key) = target else { return };
+                match self.writable_fs(&key, cx) {
+                    Some(Ok(fs)) => (key, fs),
+                    Some(Err(e)) => {
+                        self.banner = Some(e);
+                        return;
+                    }
+                    None => return,
+                }
+            }
+            XferDirection::Download => {
+                let key = self.machines.iter().find(|m| m.spec.local).map(|m| m.spec.key.clone()).unwrap_or_else(|| "local".into());
+                (key, self.local_fs.clone())
+            }
+        };
+        let (src_fs, sources) = (req.src_fs.clone(), req.sources.clone());
+        let check_fs = dst_fs.clone();
+        let d2 = dir.clone();
+        self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+            // (source, name, exists, part left, a free name)
+            let found = cx
+                .background_spawn(async move {
+                    sources
+                        .into_iter()
+                        .map(|s| {
+                            let name = s.trim_end_matches('/').rsplit('/').next().unwrap_or(&s).to_string();
+                            let at = |n: &str| files::join(&d2, n);
+                            let exists = check_fs.stat(&at(&name)).is_ok();
+                            let part = check_fs.stat(&files::transfer::part_path(&at(&name))).is_ok();
+                            let free = if exists { unique_name(|n| check_fs.stat(&at(n)).is_ok(), &name) } else { name.clone() };
+                            (s, name, exists, part, free)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let conflicts = found.iter().filter(|f| f.2).count();
+            let parts = found.iter().filter(|f| f.3 && !f.2).count();
+            let mut policy = OnConflict::Skip;
+            if conflicts > 0 {
+                let Ok(answer) = this.update_in(cx, |_, window, cx| {
+                    let names = found.iter().filter(|f| f.2).map(|f| f.1.clone()).collect::<Vec<_>>();
+                    window.prompt(
+                        PromptLevel::Warning,
+                        t("Already there at the target:", "目标位置已有同名项:"),
+                        Some(&crate::preview::unsaved_summary(&names)),
+                        &[
+                            PromptButton::Ok(t("Overwrite", "覆盖").into()),
+                            PromptButton::Other(t("Keep both", "保留两者").into()),
+                            PromptButton::Other(t("Skip them", "跳过这些").into()),
+                            PromptButton::Cancel(t("Cancel", "取消").into()),
+                        ],
+                        cx,
+                    )
+                }) else {
+                    return;
+                };
+                policy = match answer.await {
+                    Ok(0) => OnConflict::Overwrite,
+                    Ok(1) => OnConflict::KeepBoth,
+                    Ok(2) => OnConflict::Skip,
+                    _ => return,
+                };
+            }
+            let mut resume = true;
+            if parts > 0 {
+                let Ok(answer) = this.update_in(cx, |_, window, cx| {
+                    window.prompt(
+                        PromptLevel::Info,
+                        t("An unfinished copy was found at the target.", "目标位置有未完成的传输。"),
+                        None,
+                        &[PromptButton::Ok(t("Resume", "续传").into()), PromptButton::Other(t("Start over", "重新开始").into())],
+                        cx,
+                    )
+                }) else {
+                    return;
+                };
+                resume = answer.await == Ok(0);
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                for (src, name, exists, part, free) in found {
+                    if exists && policy == OnConflict::Skip {
+                        continue;
+                    }
+                    let dst_name = if exists && policy == OnConflict::KeepBoth { free } else { name };
+                    let job = NewTransfer {
+                        direction: req.direction,
+                        src_machine: req.src_machine.clone(),
+                        src_path: src,
+                        dst_machine: dst_machine.clone(),
+                        dst_dir: dir.clone(),
+                        dst_name,
+                        overwrite: exists && policy == OnConflict::Overwrite,
+                    };
+                    let id = this.transfers.add(job);
+                    this.transfers.set_resume(id, part && resume && !exists);
+                    this.transfer_fs.insert(id, (src_fs.clone(), dst_fs.clone()));
+                }
+                this.transfers_open = true;
+                this.pump_transfers(window, cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Starts what may start, and the progress ticker while anything runs.
+    fn pump_transfers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while let Some(id) = self.transfers.next_to_start() {
+            let (Some(t), Some((src, dst))) = (self.transfers.get(id).cloned(), self.transfer_fs.get(&id).cloned()) else {
+                self.transfers.finished(id, Err(t("Lost its machine.", "找不到机器。").into()));
+                continue;
+            };
+            let progress = Arc::new(Mutex::new((0u64, 0u64)));
+            let stop = Arc::new(AtomicBool::new(false));
+            self.transfer_runs.insert(id, (progress.clone(), stop.clone()));
+            let (job, resume) = (t.job.clone(), t.resume);
+            self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+                let result = cx.background_spawn(async move { run_transfer(&*src, &*dst, &job, resume, &progress, &stop) }).await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    // The last progress, even when the run was quicker than the ticker.
+                    if let Some((p, _)) = this.transfer_runs.remove(&id) {
+                        let (done, total) = *p.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        this.transfers.progress(id, done, total, Instant::now());
+                    }
+                    this.transfers.finished(id, result);
+                    this.after_transfer(id, cx);
+                    this.pump_transfers(window, cx);
+                    cx.notify();
+                });
+            }));
+        }
+        if self.transfer_tick.is_none() && !self.transfer_runs.is_empty() {
+            self.transfer_tick = Some(cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_millis(250)).await;
+                    let more = this
+                        .update(cx, |this, cx| {
+                            let now = Instant::now();
+                            let snap: Vec<(TransferId, (u64, u64))> = this
+                                .transfer_runs
+                                .iter()
+                                .map(|(id, (p, _))| (*id, *p.lock().unwrap_or_else(std::sync::PoisonError::into_inner)))
+                                .collect();
+                            for (id, (done, total)) in snap {
+                                this.transfers.progress(id, done, total, now);
+                            }
+                            cx.notify();
+                            let more = !this.transfer_runs.is_empty();
+                            if !more {
+                                this.transfer_tick = None;
+                            }
+                            more
+                        })
+                        .unwrap_or(false);
+                    if !more {
+                        break;
+                    }
+                }
+            }));
+        }
+    }
+
+    /// A finished upload shows in the file panel when it shows that folder.
+    fn after_transfer(&mut self, id: TransferId, cx: &mut Context<Self>) {
+        let Some(t) = self.transfers.get(id) else { return };
+        if t.state != XferState::Done {
+            return;
+        }
+        let panel = self.files.read(cx);
+        if panel.machine() == Some(t.job.dst_machine.as_str()) {
+            self.files.update(cx, |f, cx| f.refresh(cx));
+        }
+    }
+
+    fn cancel_transfer(&mut self, id: TransferId, cx: &mut Context<Self>) {
+        if self.transfers.cancel(id)
+            && let Some((_, stop)) = self.transfer_runs.get(&id)
+        {
+            stop.store(true, Ordering::SeqCst);
+        }
+        cx.notify();
+    }
+
+    fn machine_name(&self, key: &str) -> String {
+        self.machine(key).map(|m| m.spec.name.clone()).unwrap_or_else(|| key.to_string())
+    }
+
+    fn render_transfers(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.transfers_open || self.transfers.items().is_empty() {
+            return None;
+        }
+        let mut list = div().flex().flex_col().gap_0p5().overflow_hidden();
+        for x in self.transfers.items().iter().rev() {
+            let t_ = t;
+            let t = x;
+            let id = t.id;
+            let arrow = if t.job.direction == XferDirection::Upload { "↑" } else { "↓" };
+            let from = format!("{}:{}", self.machine_name(&t.job.src_machine), t.job.src_path);
+            let to = format!("{}:{}", self.machine_name(&t.job.dst_machine), files::join(&t.job.dst_dir, &t.job.dst_name));
+            let pct = (t.total > 0).then(|| t.done as f32 * 100.0 / t.total as f32);
+            let status = match &t.state {
+                XferState::Queued => t_("Waiting", "等待中").to_string(),
+                XferState::Running => format!("{} / {} · {}/s", human(t.done), human(t.total), human(t.speed as u64)),
+                XferState::Done => format!("{} · {}", t_("Done", "完成"), human(t.total)),
+                XferState::Failed(why) => format!("{} {why}", t_("Failed:", "失败:")),
+                XferState::Canceled => t_("Canceled", "已取消").to_string(),
+            };
+            let mut row = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .text_xs()
+                .child(div().w(px(12.)).child(arrow))
+                .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(format!("{from}  →  {to}")))
+                .child(div().w(px(120.)).child(match (&t.state, pct) {
+                    (XferState::Running, p) => gpui_cn::Progress::new(SharedString::from(format!("xfer-{id}"))).value(p).into_any_element(),
+                    (XferState::Done, _) => gpui_cn::Progress::new(SharedString::from(format!("xfer-{id}"))).value(100.0).into_any_element(),
+                    _ => div().into_any_element(),
+                }))
+                .child(div().w(px(220.)).overflow_hidden().whitespace_nowrap().text_ellipsis().text_color(rgb(0xa0a0a0)).child(status));
+            row = match t.state {
+                XferState::Queued | XferState::Running => row.child(
+                    Button::new(SharedString::from(format!("xfer-cancel-{id}"))).ghost().size(ButtonSize::Xs).icon(IconName::X).tooltip(t_("Cancel", "取消")).on_click(cx.listener(move |this, _, _, cx| this.cancel_transfer(id, cx))),
+                ),
+                XferState::Failed(_) | XferState::Canceled => row.child(
+                    Button::new(SharedString::from(format!("xfer-retry-{id}"))).ghost().size(ButtonSize::Xs).icon(IconName::RotateCcw).tooltip(t_("Retry", "重试")).on_click(cx.listener(move |this, _, window, cx| {
+                        this.transfers.retry(id);
+                        this.pump_transfers(window, cx);
+                        cx.notify();
+                    })),
+                ),
+                XferState::Done => row.child(div().w(px(20.))),
+            };
+            list = list.child(row);
+        }
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .text_xs()
+            .text_color(rgb(0xa0a0a0))
+            .child(format!("{} · {} {}", t("Transfers", "传输"), self.transfers.active(), t("active", "进行中")))
+            .child(div().flex_1())
+            .child(Button::new("xfer-clear").ghost().size(ButtonSize::Xs).label(t("Clear finished", "清除已完成")).on_click(cx.listener(|this, _, _, cx| {
+                this.transfers.clear_finished();
+                cx.notify();
+            })))
+            .child(Button::new("xfer-hide").ghost().size(ButtonSize::Xs).icon(IconName::X).tooltip(t("Hide", "隐藏")).on_click(cx.listener(|this, _, _, cx| {
+                this.transfers_open = false;
+                cx.notify();
+            })));
+        Some(div().flex_none().max_h(px(180.)).py_1().border_t_1().border_color(rgb(0x2a2a2a)).bg(rgb(0x1b1b1b)).flex().flex_col().gap_1().child(header).child(list))
     }
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1881,6 +2310,89 @@ impl Workspace {
                         .into_any_element(),
                 )
             }
+            Modal::Transfer { req, folder, target } => {
+                let upload = req.direction == XferDirection::Upload;
+                let names: Vec<String> = req.sources.iter().map(|s| s.trim_end_matches('/').rsplit('/').next().unwrap_or(s).to_string()).collect();
+                let mut body = div().flex().flex_col().gap_2().min_w(px(520.)).text_sm();
+                body = body.child(div().text_color(rgb(0xb0b0b0)).child(format!(
+                    "{} {}: {}",
+                    names.len(),
+                    t("item(s)", "项"),
+                    crate::preview::unsaved_summary(&names)
+                )));
+                if upload {
+                    let mut row = div().flex().flex_wrap().gap_1().items_center().child(div().w(px(90.)).child(t("To machine", "目标机器")));
+                    for (key, name) in self.upload_targets(cx) {
+                        let k = key.clone();
+                        let b = Button::new(SharedString::from(format!("xfer-target-{key}")))
+                            .size(ButtonSize::Xs)
+                            .label(name)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Modal::Transfer { target, .. } = &mut this.modal {
+                                    *target = Some(k.clone());
+                                }
+                                cx.notify();
+                            }));
+                        row = row.child(if target.as_deref() == Some(key.as_str()) { b.primary() } else { b.outline() });
+                    }
+                    body = body.child(row);
+                }
+                let label = if upload { t("Folder there", "目标目录") } else { t("Save to", "保存到") };
+                let mut folder_row = div().flex().items_center().gap_1().child(div().w(px(90.)).child(label)).child(div().flex_1().child(Input::new(folder)));
+                if !upload {
+                    folder_row = folder_row.child(Button::new("xfer-browse").size(ButtonSize::Xs).label(t("Browse…", "浏览…")).on_click(cx.listener(|this, _, window, cx| {
+                        let picked = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: None });
+                        this.tasks.push(cx.spawn_in(window, async move |this, cx| {
+                            if let Ok(Ok(Some(mut paths))) = picked.await
+                                && let Some(p) = paths.pop()
+                            {
+                                let _ = this.update_in(cx, |this, window, cx| {
+                                    if let Modal::Transfer { folder, .. } = &this.modal {
+                                        let f = folder.clone();
+                                        f.update(cx, |i, cx| i.set_value(p.to_string_lossy().into_owned(), window, cx));
+                                    }
+                                });
+                            }
+                        }));
+                    })));
+                }
+                body = body.child(folder_row);
+                let footer = div()
+                    .flex()
+                    .gap_2()
+                    .child(Button::new("xfer-cancel").label(t("Cancel", "取消")).on_click(cx.listener(|this, _, window, cx| {
+                        this.modal = Modal::None;
+                        this.focus_terminal(window, cx);
+                        cx.notify();
+                    })))
+                    .child(
+                        Button::new("xfer-start")
+                            .primary()
+                            .label(if upload { t("Upload", "上传") } else { t("Download", "下载") })
+                            .disabled(upload && target.is_none())
+                            .on_click(cx.listener(|this, _, window, cx| this.start_transfer(window, cx))),
+                    );
+                Some(
+                    Dialog::new("transfer")
+                        .open(true)
+                        .title(if upload { t("Upload", "上传") } else { t("Download", "下载") })
+                        .w(px(620.))
+                        .on_open_change(move |open, window, cx| {
+                            if !open {
+                                let _ = this.update(cx, |this, cx| {
+                                    if matches!(this.modal, Modal::Transfer { .. }) {
+                                        this.modal = Modal::None;
+                                        this.focus_terminal(window, cx);
+                                        cx.notify();
+                                    }
+                                });
+                            }
+                        })
+                        .footer(footer)
+                        .child(body)
+                        .into_any_element(),
+                )
+            }
             Modal::Rename { input, .. } => Some(
                 Dialog::new("rename-session")
                     .open(true)
@@ -1984,6 +2496,7 @@ impl Workspace {
             .px_2()
             .child(tool("tb-search", IconName::Search, format!("{} ({main}-F)", t("Search scrollback", "搜索回滚内容")), Command::Search, false, cx))
             .child(tool("tb-files", IconName::FolderTree, format!("{} ({main}-O)", t("Files", "文件栏")), Command::ToggleFiles, self.files_open, cx))
+            .child(tool("tb-transfers", IconName::ArrowUpDown, t("Transfers", "传输列表").to_string(), Command::ToggleTransfers, self.transfers_open, cx))
             .child(tool("tb-palette", IconName::Command, format!("{} ({main}-P)", t("Command palette", "命令面板")), Command::Palette, false, cx))
             .child(tool("tb-settings", IconName::Settings, format!("{} ({main}-,)", t("Settings", "设置")), Command::Settings, false, cx))
     }
@@ -2155,6 +2668,7 @@ impl Render for Workspace {
                     .child(self.render_toolbar(cx)),
             )
             .child(self.render_panes(cx))
+            .children(self.render_transfers(cx))
             .when_some(status, |d, s| {
                 d.child(
                     div()

@@ -11,7 +11,7 @@ use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::base::Disableable as _;
 use gpui_kit::{
-    App, AppContext as _, Focusable as _, ClipboardItem, Context, Div, Entity, EventEmitter, InteractiveElement as _, IntoElement, ParentElement as _, PromptButton,
+    App, AppContext as _, ExternalPaths, Focusable as _, ClipboardItem, Context, Div, Entity, EventEmitter, InteractiveElement as _, IntoElement, ParentElement as _, PromptButton,
     PromptLevel, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px, rgb, uniform_list,
 };
 
@@ -67,6 +67,12 @@ pub enum PanelEvent {
     NewFile { path: String },
     /// Refresh with nothing to refresh (the connection failed): find the place again.
     Retry,
+    /// Upload into this folder (files to be picked).
+    Upload { dir: String },
+    /// Files dropped on the panel, to upload into this folder.
+    Dropped { paths: Vec<std::path::PathBuf>, dir: String },
+    /// Download this file or folder.
+    Download { path: String },
     CdHere { path: String },
     PickMachine(String),
     Follow,
@@ -532,6 +538,16 @@ impl FilePanel {
                     cx.write_to_clipboard(ClipboardItem::new_string(p));
                 }
             })))
+            .child(tool("files-upload", IconName::Upload, t("Upload here", "上传到这里"), writable).on_click(cx.listener(|this, _, _, cx| {
+                if let Some(d) = this.target_dir() {
+                    cx.emit(PanelEvent::Upload { dir: d });
+                }
+            })))
+            .child(tool("files-download", IconName::Download, t("Download", "下载"), has_sel).on_click(cx.listener(|this, _, _, cx| {
+                if let Some(p) = this.selected.clone() {
+                    cx.emit(PanelEvent::Download { path: p });
+                }
+            })))
             .child(tool("files-cd", IconName::SquareTerminal, t("cd the terminal here", "让终端 cd 到这里"), self.root.is_some()).on_click(cx.listener(|this, _, _, cx| {
                 if let Some(d) = this.target_dir() {
                     cx.emit(PanelEvent::CdHere { path: d });
@@ -578,7 +594,24 @@ impl Render for FilePanel {
                         cx.notify();
                     })),
             );
-        let mut panel = div().size_full().flex().flex_col().gap_1().p_1().text_sm().text_color(rgb(0xd6d6d6)).child(header);
+        let mut panel = div()
+            .id("file-panel")
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_1()
+            .text_sm()
+            .text_color(rgb(0xd6d6d6))
+            // Files from the desktop: uploaded into the folder shown (or the selected one).
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                if this.read_only.is_none()
+                    && let Some(d) = this.target_dir()
+                {
+                    cx.emit(PanelEvent::Dropped { paths: paths.paths().to_vec(), dir: d });
+                }
+            }))
+            .child(header);
         if self.picker_open {
             let mut list = div().flex().flex_col().border_1().border_color(rgb(0x3a3a3a)).rounded_md();
             for (key, name) in &self.machines {

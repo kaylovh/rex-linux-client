@@ -70,6 +70,7 @@ pub struct SettingsView {
     focus: FocusHandle,
     host_groups: Vec<HostGroup>,
     shown_hosts: Vec<ShownHosts>,
+    downloads: Entity<InputState>,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -99,7 +100,12 @@ impl SettingsView {
             focus: cx.focus_handle(),
             host_groups,
             shown_hosts: settings.shown_hosts.clone(),
+            downloads: input(settings.download_dir.clone().unwrap_or_default(), "~/Downloads", window, cx),
         }
+    }
+
+    fn download_value(&self, cx: &App) -> Option<String> {
+        Some(self.downloads.read(cx).value().trim().to_string()).filter(|d| !d.is_empty())
     }
 
     fn host_visible(&self, group: &HostGroup, label: &str) -> bool {
@@ -138,7 +144,7 @@ impl SettingsView {
         let read = |e: &Entity<InputState>, cx: &Context<Self>| e.read(cx).value().to_string();
         match parse_font(&read(&self.family, cx), &read(&self.size, cx), &read(&self.fallbacks, cx)) {
             Ok(font) => {
-                let s = Settings { language: self.language, machines: self.machines.clone(), font, shown_hosts: self.shown_hosts.clone() };
+                let s = Settings { language: self.language, machines: self.machines.clone(), font, shown_hosts: self.shown_hosts.clone(), download_dir: self.download_value(cx) };
                 self.error = None;
                 cx.emit(SettingsEvent::Save(s));
             }
@@ -235,6 +241,8 @@ impl Render for SettingsView {
                 }
                 row
             }))
+            .child(Self::section(t("Downloads", "下载")))
+            .child(field(t("Folder", "目录"), &self.downloads))
             .child(Self::section(t("Terminal font", "终端字体")))
             .child(field(t("Family", "字体"), &self.family))
             .child(field(t("Size", "字号"), &self.size))

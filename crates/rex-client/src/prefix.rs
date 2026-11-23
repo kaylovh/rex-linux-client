@@ -38,6 +38,8 @@ pub enum Command {
     ToggleFiles,
     /// Save the file being edited (not a prefix key).
     Save,
+    /// Show or hide the transfer list (not a prefix key).
+    ToggleTransfers,
 }
 
 /// The command for `key` (a GPUI key name such as "c", "%", "left", "b") pressed after the

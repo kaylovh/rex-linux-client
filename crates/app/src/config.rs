@@ -48,6 +48,8 @@ pub struct Settings {
     pub machines: Vec<MachineConfig>,
     pub font: FontSettings,
     pub shown_hosts: Vec<ShownHosts>,
+    /// Where downloads go; None: ~/Downloads.
+    pub download_dir: Option<String>,
 }
 
 /// A preview left open: the machine, the path, and how it was read ("local" or
@@ -114,6 +116,14 @@ pub fn config_dir(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     } else {
         home.join(".config/rexa-desktop")
     })
+}
+
+/// Where downloads go: the setting, else ~/Downloads.
+pub fn download_dir(s: &Settings, get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    match s.download_dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => Some(d.to_string()),
+        None => get("HOME").filter(|h| !h.is_empty()).map(|h| format!("{h}/Downloads")),
+    }
 }
 
 /// Where in-place saves keep the old contents: the user's cache folder, rexa-desktop/backups.
@@ -200,6 +210,7 @@ mod tests {
             machines: vec![MachineConfig { name: "dev".into(), endpoint: "ssh://dev".into() }],
             font: FontSettings { family: Some("Iosevka".into()), size: Some(15.0), fallbacks: vec!["Noto Color Emoji".into()] },
             shown_hosts: vec![ShownHosts { server: "local".into(), hosts: vec!["studio".into()] }],
+            download_dir: Some("/data/in".into()),
         };
         save_settings(&d, &s, false).unwrap();
         assert_eq!(load_settings(&d), (s, None));
@@ -267,6 +278,16 @@ mod tests {
         let d = tmp("badstate");
         fs::write(d.join("state.json"), "nonsense").unwrap();
         assert_eq!(load_state(&d), WorkspaceState::default());
+    }
+
+    #[test]
+    fn download_dir_default_and_setting() {
+        let env = |k: &str| (k == "HOME").then(|| "/h".to_string());
+        assert_eq!(download_dir(&Settings::default(), env), Some("/h/Downloads".into()));
+        let s = Settings { download_dir: Some("/data/in".into()), ..Default::default() };
+        assert_eq!(download_dir(&s, env), Some("/data/in".into()));
+        let blank = Settings { download_dir: Some("  ".into()), ..Default::default() };
+        assert_eq!(download_dir(&blank, env), Some("/h/Downloads".into()));
     }
 
     #[cfg(target_os = "linux")]

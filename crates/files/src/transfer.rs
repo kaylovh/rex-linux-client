@@ -182,7 +182,8 @@ pub fn copy_file(
     }
 }
 
-/// Copies what `plan` lists (from `plan_tree(src, src_path)`) into `dst_dir`. Folders are
+/// Copies what `plan` lists (from `plan_tree(src, src_path)`) into `dst_dir`, the top item
+/// named `dst_top` there (a "keep both" copy has another name). Folders are
 /// made as needed; a file already there whole (same size, no part) is taken as done, so a
 /// retry continues where the last run stopped.
 pub fn copy_tree(
@@ -190,15 +191,17 @@ pub fn copy_tree(
     src_path: &str,
     dst: &dyn FileSystem,
     dst_dir: &str,
+    dst_top: &str,
     plan: &Plan,
     overwrite: bool,
     on: &mut dyn FnMut(Progress) -> bool,
 ) -> Result<u64, CopyError> {
+    let top = plan.items.first().map(|i| i.rel.clone()).unwrap_or_default();
     let src_base = crate::parent(src_path.trim_end_matches('/')).unwrap_or_else(|| "/".into());
     let mut done = 0u64;
     for item in &plan.items {
         let from = join(&src_base, &item.rel);
-        let to = join(dst_dir, &item.rel);
+        let to = join(dst_dir, &format!("{dst_top}{}", &item.rel[top.len().min(item.rel.len())..]));
         match item.kind {
             ItemKind::Dir => match dst.create_dir(&to) {
                 Ok(()) | Err(FsError::Exists) => {}
@@ -311,13 +314,16 @@ pub(crate) mod tests {
         let plan = plan_tree(src, &tree).unwrap();
         assert_eq!(plan.skipped, 1);
         assert_eq!(plan.total, 12);
-        copy_tree(src, &tree, dst, dst_root, &plan, false, &mut |_| true).unwrap();
+        copy_tree(src, &tree, dst, dst_root, "proj dir", &plan, false, &mut |_| true).unwrap();
         assert_eq!(fs::read(format!("{dst_root}/proj dir/src/deep/a.rs")).unwrap(), b"fn a() {}");
         assert_eq!(fs::read(format!("{dst_root}/proj dir/.env")).unwrap(), b"K=1");
         assert!(std::path::Path::new(&format!("{dst_root}/proj dir/empty")).is_dir());
         assert!(!std::path::Path::new(&format!("{dst_root}/proj dir/etc-link")).exists());
+        // Kept both: the same tree under another name.
+        copy_tree(src, &tree, dst, dst_root, "proj dir (1)", &plan, false, &mut |_| true).unwrap();
+        assert_eq!(fs::read(format!("{dst_root}/proj dir (1)/src/deep/a.rs")).unwrap(), b"fn a() {}");
         // Again (a retry): what's there is left alone, nothing fails.
-        copy_tree(src, &tree, dst, dst_root, &plan, false, &mut |_| true).unwrap();
+        copy_tree(src, &tree, dst, dst_root, "proj dir", &plan, false, &mut |_| true).unwrap();
     }
 
     #[test]

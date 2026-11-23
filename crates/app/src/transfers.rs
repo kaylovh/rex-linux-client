@@ -163,6 +163,12 @@ impl Queue {
         self.items.retain(|t| matches!(t.state, State::Queued | State::Running));
     }
 
+    pub fn set_resume(&mut self, id: TransferId, resume: bool) {
+        if let Some(t) = self.get_mut(id) {
+            t.resume = resume;
+        }
+    }
+
     /// Queued or running.
     pub fn active(&self) -> usize {
         self.items.iter().filter(|t| matches!(t.state, State::Queued | State::Running)).count()
