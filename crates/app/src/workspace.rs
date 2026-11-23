@@ -244,6 +244,8 @@ pub struct Workspace {
     focused_block: Option<String>,
     panes: PaneSet,
     tabs: Entity<TabsState>,
+    /// A tab's name is being edited (the terminal must not take the focus).
+    tab_renaming: bool,
     sidebar: Entity<SidebarState>,
     /// A message for the whole window (connecting, failed).
     banner: Option<String>,
@@ -358,6 +360,7 @@ impl Workspace {
             focused_block: None,
             panes: PaneSet::default(),
             tabs: tabs.clone(),
+            tab_renaming: false,
             sidebar,
             banner: None,
             notices: init.notices,
@@ -392,6 +395,16 @@ impl Workspace {
             tasks: Vec::new(),
         };
         cx.subscribe_in(&tabs, window, Self::on_tab_event).detach();
+        // A tab's name field holds the focus while it is open; the terminal gets it back after.
+        cx.observe_in(&tabs, window, |this, tabs, window, cx| {
+            let renaming = tabs.read(cx).renaming().is_some();
+            let ended = this.tab_renaming && !renaming;
+            this.tab_renaming = renaming;
+            if ended {
+                this.focus_terminal(window, cx);
+            }
+        })
+        .detach();
         let keys: Vec<String> = me.machines.iter().map(|m| m.spec.key.clone()).collect();
         for k in keys {
             me.connect_machine(k, window, cx);
@@ -767,6 +780,9 @@ impl Workspace {
     /// Focuses the server's focused block, or the workspace itself when that isn't a live
     /// terminal, so shortcuts keep working.
     fn focus_terminal(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.read(cx).renaming().is_some() {
+            return;
+        }
         match self.focused_block.as_deref().and_then(|b| self.panes.terminal(b)) {
             Some(term) => term.read(cx).focus_handle().clone().focus(window, cx),
             None => self.focus.focus(window, cx),
@@ -1214,15 +1230,9 @@ impl Workspace {
             // Renaming sessions comes with the M2b palette/settings work.
             Command::RenameSession => self.open_rename(window, cx),
             Command::CloseSession => {
-                let label = self.session_label(&sid);
-                self.confirm(
-                    t("Close this session?", "关闭这个 session?"),
-                    &format!("{label} — {}", t("every tab and program in it will end.", "其中所有 tab 和程序都会结束。")),
-                    t("Close", "关闭"),
-                    move |this, _, _| this.send("session.destroy", json!({"session_id": sid})),
-                    window,
-                    cx,
-                );
+                if let Some(k) = self.shown.clone() {
+                    self.close_session(k, sid, window, cx);
+                }
             }
             Command::Palette | Command::Settings => {}
             Command::Search => self.open_search(window, cx),
@@ -1335,11 +1345,25 @@ impl Workspace {
 
     // ---- dialogs ----------------------------------------------------------------------
 
-    fn session_label(&self, sid: &str) -> String {
-        self.shown_machine()
+    /// Asks, then ends session `sid` on machine `machine` (from the sidebar or the palette).
+    fn close_session(&mut self, machine: String, sid: String, window: &mut Window, cx: &mut Context<Self>) {
+        let label = self
+            .machine(&machine)
             .and_then(|m| m.model.sessions.iter().find(|s| s.id == sid))
             .map(|s| session_name(&s.id, &s.label))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.confirm(
+            t("Close this session?", "关闭这个 session?"),
+            &format!("{label} — {}", t("every tab and program in it will end.", "其中所有 tab 和程序都会结束。")),
+            t("Close", "关闭"),
+            move |this, _, _| {
+                if let Some(c) = this.machine(&machine).and_then(|m| m.control.clone()) {
+                    c.send("session.destroy", json!({"session_id": sid}));
+                }
+            },
+            window,
+            cx,
+        );
     }
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2531,6 +2555,20 @@ impl Workspace {
                     .on_click(cx.listener(move |this, _, window, cx| this.open(k.clone(), id.clone(), window, cx)));
                 if let Some(b) = status_badge(m.model.session_status(&s.id)) {
                     button = button.badge(b);
+                }
+                if m.conn == ConnState::Connected {
+                    let (k, id) = (key.clone(), s.id.clone());
+                    button = button.action(
+                        Button::new(SharedString::from(format!("close-session-{key}-{}", s.id)))
+                            .ghost()
+                            .size(ButtonSize::Xs)
+                            .icon(IconName::X)
+                            .tooltip(t("Close session", "关闭 session"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.close_session(k.clone(), id.clone(), window, cx);
+                            })),
+                    );
                 }
                 group = group.child(button);
             }
