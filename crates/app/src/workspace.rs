@@ -8,10 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_cn::{
-    Button, CommandDialog, CommandEvent, CommandItem, CommandState, Dialog, Input, Sidebar, SidebarGroup, SidebarLayout, SidebarMenuButton,
+    Button, ButtonSize, CommandDialog, CommandEvent, CommandItem, CommandState, Dialog, Input, Sidebar, SidebarGroup, SidebarLayout, SidebarMenuButton,
     SidebarState, Tab, Tabs, TabsEvent, TabsState,
 };
 use gpui_kit::base::input::{InputEvent, InputState};
+use gpui_kit::assets::IconName;
 use gpui_kit::base::Selectable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -1903,6 +1904,25 @@ impl Workspace {
         bar
     }
 
+    /// Buttons for what otherwise only has a shortcut, at the right of the tab strip.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> Div {
+        let main = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl-Shift" };
+        let tool = |id: &'static str, icon: IconName, tip: String, cmd: Command, on: bool, cx: &mut Context<Self>| {
+            let b = Button::new(id).ghost().size(ButtonSize::Xs).icon(icon).tooltip(tip).on_click(cx.listener(move |this, _, window, cx| this.run(cmd, window, cx)));
+            if on { b.selected(true) } else { b }
+        };
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .px_2()
+            .child(tool("tb-search", IconName::Search, format!("{} ({main}-F)", t("Search scrollback", "搜索回滚内容")), Command::Search, false, cx))
+            .child(tool("tb-files", IconName::FolderTree, format!("{} ({main}-O)", t("Files", "文件栏")), Command::ToggleFiles, self.files_open, cx))
+            .child(tool("tb-palette", IconName::Command, format!("{} ({main}-P)", t("Command palette", "命令面板")), Command::Palette, false, cx))
+            .child(tool("tb-settings", IconName::Settings, format!("{} ({main}-,)", t("Settings", "设置")), Command::Settings, false, cx))
+    }
+
     fn pane_cell(&self, p: &rex_client::layout::Pane, cx: &mut Context<Self>) -> Div {
         let r = p.rect;
         let focused = self.focused_block.as_deref() == Some(p.block_id.as_str());
@@ -2060,7 +2080,15 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .bg(rgb(0x1e1e1e))
-            .child(div().flex_none().h(px(40.)).overflow_hidden().child(Tabs::new("tabs", &self.tabs).renamable(true).confirm_close(true).addable(true)))
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(40.))
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().min_w_0().h_full().overflow_hidden().child(Tabs::new("tabs", &self.tabs).renamable(true).confirm_close(true).addable(true)))
+                    .child(self.render_toolbar(cx)),
+            )
             .child(self.render_panes(cx))
             .when_some(status, |d, s| {
                 d.child(
