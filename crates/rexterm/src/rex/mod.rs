@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use gpui_cn::terminal::{
     ByteHandle, ByteSink, ByteSource, Engine, EngineOptions, ExitStatus, InputRoute, TerminalInput, Viewport,
 };
+use gpui_cn::terminal::input::{MouseAction, MouseButton, MouseInput};
 use rex_proto::data::{DataConn, DataError, DataItem, TERMINAL_V1};
 use rex_proto::scan::{ScanItem, Scanner};
 use serde_json::json;
@@ -57,6 +58,7 @@ impl ByteSource for RexSource {
             closed_code: Mutex::new(None),
             conn_closer: Mutex::new(None),
             resize: Mutex::new((0, None)),
+            cell: Mutex::new((8, 16)),
         });
         let reader = Reader { block: block.clone(), sink, events, shared: shared.clone() };
         std::thread::Builder::new().name("rex-terminal".into()).spawn(move || reader.run(attached))?;
@@ -72,6 +74,8 @@ struct Shared {
     conn_closer: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// (generation, latest requested size) for the debounced resize request.
     resize: Mutex<(u64, Option<(u16, u16)>)>,
+    /// The cell size in device pixels, for pointer positions.
+    cell: Mutex<(u32, u32)>,
 }
 
 /// Delay before a UI size is sent to Rex, so a drag doesn't flood the server.
@@ -197,6 +201,37 @@ fn paste_chunks(text: &str, max: usize) -> Vec<&str> {
     out
 }
 
+/// A pointer event for Rex's block.event: the wheel, or a button / motion at a cell (0-based).
+/// `cell` is the cell size in the same device pixels as the input's position.
+fn mouse_event(m: &MouseInput, cell: (u32, u32)) -> Option<serde_json::Value> {
+    let at = |v: f32, size: u32| (v.max(0.0) / size.max(1) as f32).floor() as u32;
+    let (x, y) = (at(m.x, cell.0), at(m.y, cell.1));
+    let mods: Vec<&str> = [(m.modifiers.shift, "shift"), (m.modifiers.control, "ctrl"), (m.modifiers.alt, "alt"), (m.modifiers.super_key, "super")]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect();
+    let mods = mods.join("+");
+    let wheel = |dy: i32| json!({"type": "wheel", "payload": {"delta_x": 0, "delta_y": dy, "x": x, "y": y, "mods": mods}});
+    let action = match m.action {
+        MouseAction::ScrollUp => return Some(wheel(-1)),
+        MouseAction::ScrollDown => return Some(wheel(1)),
+        MouseAction::Press => "press",
+        MouseAction::Release => "release",
+        MouseAction::Move => "motion",
+    };
+    let button = match m.button {
+        Some(MouseButton::Left) => "left",
+        Some(MouseButton::Middle) => "middle",
+        Some(MouseButton::Right) => "right",
+        None => "none",
+    };
+    let mut buttons = serde_json::Map::new();
+    if m.action != MouseAction::Release && button != "none" {
+        buttons.insert(button.into(), json!(true));
+    }
+    Some(json!({"type": "mouse", "payload": {"action": action, "button": button, "buttons": buttons, "x": x, "y": y, "mods": mods}}))
+}
+
 struct RexHandle {
     block: BlockRef,
     shared: Arc<Shared>,
@@ -222,6 +257,7 @@ impl ByteHandle for RexHandle {
     }
 
     fn resize(&self, viewport: Viewport) -> io::Result<()> {
+        *self.shared.cell.lock().unwrap() = (viewport.cell_width(), viewport.cell_height());
         let size = (viewport.columns(), viewport.rows());
         let generation = {
             let mut r = self.shared.resize.lock().unwrap();
@@ -291,7 +327,14 @@ impl ByteHandle for RexHandle {
                 self.block_event(json!({"type": "focus", "payload": {"action": if *on { "in" } else { "out" }}}));
                 InputRoute::Handled
             }
-            // Scrolling is local; pointer reporting goes to the program in a later milestone.
+            // The engine asks only while the program reports the mouse: Rex's terminal encodes it.
+            TerminalInput::Mouse(m) => {
+                let cell = *self.shared.cell.lock().unwrap();
+                if let Some(ev) = mouse_event(m, cell) {
+                    self.block_event(ev);
+                }
+                InputRoute::Handled
+            }
             _ => InputRoute::Encode,
         }
     }
@@ -300,6 +343,31 @@ impl ByteHandle for RexHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_becomes_rex_events() {
+        use gpui_cn::terminal::input::Modifiers;
+        let cell = (10, 20);
+        let up = MouseInput::new(MouseAction::ScrollUp, 55.0, 70.0);
+        assert_eq!(mouse_event(&up, cell), Some(json!({"type": "wheel", "payload": {"delta_x": 0, "delta_y": -1, "x": 5, "y": 3, "mods": ""}})));
+        let down = MouseInput::new(MouseAction::ScrollDown, 0.0, 0.0);
+        assert_eq!(mouse_event(&down, cell).unwrap()["payload"]["delta_y"], 1);
+        let mut press = MouseInput::new(MouseAction::Press, 31.0, 41.0).with_button(MouseButton::Left);
+        let mut mods = Modifiers::default();
+        mods.control = true;
+        mods.alt = true;
+        press.modifiers = mods;
+        assert_eq!(
+            mouse_event(&press, cell),
+            Some(json!({"type": "mouse", "payload": {"action": "press", "button": "left", "buttons": {"left": true}, "x": 3, "y": 2, "mods": "ctrl+alt"}}))
+        );
+        let drag = MouseInput::new(MouseAction::Move, 45.0, 41.0).with_button(MouseButton::Right);
+        assert_eq!(mouse_event(&drag, cell).unwrap()["payload"], json!({"action": "motion", "button": "right", "buttons": {"right": true}, "x": 4, "y": 2, "mods": ""}));
+        let hover = MouseInput::new(MouseAction::Move, 5.0, 5.0);
+        assert_eq!(mouse_event(&hover, cell).unwrap()["payload"], json!({"action": "motion", "button": "none", "buttons": {}, "x": 0, "y": 0, "mods": ""}));
+        let release = MouseInput::new(MouseAction::Release, -3.0, 5.0).with_button(MouseButton::Middle);
+        assert_eq!(mouse_event(&release, cell).unwrap()["payload"], json!({"action": "release", "button": "middle", "buttons": {}, "x": 0, "y": 0, "mods": ""}));
+    }
 
     #[test]
     fn paste_chunks_respect_limit_and_char_boundaries() {
