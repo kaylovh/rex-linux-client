@@ -47,6 +47,8 @@ pub struct Transfer {
     pub resume: bool,
     pub cancel_requested: bool,
     samples: VecDeque<(Instant, u64)>,
+    /// Shown with the result (links skipped).
+    pub note: Option<String>,
 }
 
 /// How far back the speed looks.
@@ -57,6 +59,27 @@ pub const MAX_RUNNING: usize = 2;
 pub struct Queue {
     items: Vec<Transfer>,
     next_id: TransferId,
+}
+
+/// Where a transfer writes: its machine and the target path, written one way.
+fn place(job: &NewTransfer) -> (String, String) {
+    let mut parts: Vec<&str> = Vec::new();
+    for c in job.dst_dir.split('/').chain(std::iter::once(job.dst_name.as_str())) {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+    (job.dst_machine.clone(), format!("/{}", parts.join("/")))
+}
+
+/// One path is the other or inside it.
+fn overlaps(a: &str, b: &str) -> bool {
+    let inside = |x: &str, y: &str| x == y || x.strip_prefix(y).is_some_and(|r| r.starts_with('/'));
+    inside(a, b) || inside(b, a)
 }
 
 impl Queue {
@@ -83,6 +106,7 @@ impl Queue {
             resume: false,
             cancel_requested: false,
             samples: VecDeque::new(),
+            note: None,
         });
         id
     }
@@ -90,17 +114,13 @@ impl Queue {
     /// The next queued transfer that may start now (marked running), if any: fewer than
     /// MAX_RUNNING run and none of them goes into the same place.
     pub fn next_to_start(&mut self) -> Option<TransferId> {
-        let running: Vec<(String, String, String)> = self
-            .items
-            .iter()
-            .filter(|t| t.state == State::Running)
-            .map(|t| (t.job.dst_machine.clone(), t.job.dst_dir.clone(), t.job.dst_name.clone()))
-            .collect();
+        let running: Vec<(String, String)> = self.items.iter().filter(|t| t.state == State::Running).map(|t| place(&t.job)).collect();
         if running.len() >= MAX_RUNNING {
             return None;
         }
         let t = self.items.iter_mut().find(|t| {
-            t.state == State::Queued && !running.iter().any(|(m, d, n)| *m == t.job.dst_machine && *d == t.job.dst_dir && *n == t.job.dst_name)
+            let (m, p) = place(&t.job);
+            t.state == State::Queued && !running.iter().any(|(rm, rp)| *rm == m && overlaps(rp, &p))
         })?;
         t.state = State::Running;
         t.samples.clear();
@@ -161,6 +181,12 @@ impl Queue {
 
     pub fn clear_finished(&mut self) {
         self.items.retain(|t| matches!(t.state, State::Queued | State::Running));
+    }
+
+    pub fn set_note(&mut self, id: TransferId, note: String) {
+        if let Some(t) = self.get_mut(id) {
+            t.note = Some(note);
+        }
     }
 
     pub fn set_resume(&mut self, id: TransferId, resume: bool) {
@@ -236,6 +262,27 @@ mod tests {
         assert!(!q.get(a).unwrap().cancel_requested);
         q.clear_finished();
         assert!(q.items().iter().all(|t| matches!(t.state, State::Queued | State::Running)));
+    }
+
+    fn job_to(m: &str, dir: &str, name: &str) -> NewTransfer {
+        NewTransfer { dst_machine: m.into(), dst_dir: dir.into(), ..job(name) }
+    }
+
+    #[test]
+    fn the_same_place_however_written() {
+        let mut q = Queue::default();
+        let a = q.add(job_to("m", "/srv", "report.pdf"));
+        let b = q.add(job_to("m", "/srv/", "report.pdf"));
+        let c = q.add(job_to("m", "/srv//./", "report.pdf"));
+        assert_eq!(q.next_to_start(), Some(a));
+        assert_eq!(q.next_to_start(), None, "{b} {c} go into the same place");
+        // A folder copy and a file going into it overlap too.
+        let mut q = Queue::default();
+        let f = q.add(job_to("m", "/srv", "proj"));
+        let _g = q.add(job_to("m", "/srv/proj/", "x.txt"));
+        let h = q.add(job_to("m", "/srv", "proj2"));
+        assert_eq!(q.next_to_start(), Some(f));
+        assert_eq!(q.next_to_start(), Some(h));
     }
 
     #[test]

@@ -34,9 +34,14 @@ use crate::palette::{PaletteAction, PaletteEntry, PaletteSession, palette_entrie
 use crate::file_panel::{FilePanel, PanelEvent};
 use crate::preview::{PreviewEvent, PreviewPanel};
 use crate::transfers::{Direction as XferDirection, NewTransfer, Queue, State as XferState, TransferId};
-use files::transfer::{CopyError, ItemKind, Progress as XferProgress, copy_file, copy_tree, plan_tree, unique_name};
+use files::transfer::{CopyError, Flow, ItemKind, Progress as XferProgress, copy_file, copy_tree, plan_tree, unique_name};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// A running transfer's stop flag: go on, cancel (drop the part), abort (keep it).
+const RUN_GO: u8 = 0;
+const RUN_CANCEL: u8 = 1;
+const RUN_ABORT: u8 = 2;
 use std::time::Instant;
 use crate::locate::{Source, cd_command, restorable, source_for_block, source_for_machine, source_tag};
 use crate::machines::machine_specs;
@@ -188,20 +193,27 @@ fn run_transfer(
     job: &NewTransfer,
     resume: bool,
     progress: &Mutex<(u64, u64)>,
-    stop: &AtomicBool,
-) -> Result<(), String> {
+    stop: &AtomicU8,
+) -> Result<usize, String> {
     let plan = plan_tree(src, &job.src_path).map_err(|e| crate::file_panel::fs_error_text(&e))?;
     let mut on = |p: XferProgress| {
         *progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = (p.done, p.total);
-        !stop.load(Ordering::SeqCst)
+        match stop.load(Ordering::SeqCst) {
+            RUN_GO => Flow::Go,
+            RUN_CANCEL => Flow::Cancel,
+            _ => Flow::Abort,
+        }
     };
+    if plan.items.is_empty() {
+        return Err(t("Nothing to copy: not a file or a folder.", "没有可复制的内容:不是文件或文件夹。").into());
+    }
     let to = files::join(&job.dst_dir, &job.dst_name);
     let result = match plan.items.first() {
         Some(i) if plan.items.len() == 1 && i.kind == ItemKind::File => copy_file(src, &job.src_path, dst, &to, resume, job.overwrite, &mut on).map(|_| ()),
         _ => copy_tree(src, &job.src_path, dst, &job.dst_dir, &job.dst_name, &plan, job.overwrite, &mut on).map(|_| ()),
     };
-    result.map_err(|e| match e {
-        CopyError::Canceled => t("Canceled", "已取消").to_string(),
+    result.map(|_| plan.skipped).map_err(|e| match e {
+        CopyError::Canceled | CopyError::Aborted => t("Canceled", "已取消").to_string(),
         CopyError::Exists => t("Something with that name is already there.", "目标位置已有同名文件或文件夹。").to_string(),
         CopyError::Fs(e) => crate::file_panel::fs_error_text(&e),
     })
@@ -255,7 +267,7 @@ pub struct Workspace {
     /// Each transfer's source and target file systems (kept for Retry).
     transfer_fs: std::collections::HashMap<TransferId, (Arc<dyn files::FileSystem>, Arc<dyn files::FileSystem>)>,
     /// Running transfers: progress (done, total) and the stop flag.
-    transfer_runs: std::collections::HashMap<TransferId, (Arc<Mutex<(u64, u64)>>, Arc<AtomicBool>)>,
+    transfer_runs: std::collections::HashMap<TransferId, (Arc<Mutex<(u64, u64)>>, Arc<AtomicU8>)>,
     transfer_tick: Option<Task<()>>,
     /// Quitting was confirmed with transfers running.
     quit_with_transfers: bool,
@@ -620,11 +632,15 @@ impl Workspace {
     /// Whether the window can close now; with unsaved files, asks Save all / Discard / Cancel
     /// first and says no (the answer finishes the close).
     pub fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.transfers.active() > 0 && !self.quit_with_transfers {
+        // A confirmation counts for this one close only.
+        if self.transfers.active() > 0 && !std::mem::take(&mut self.quit_with_transfers) {
             let answer = window.prompt(
                 PromptLevel::Warning,
                 t("Transfers are still running.", "还有传输在进行。"),
-                Some(t("Stopping them keeps nothing half-copied under its final name; Retry later starts them again.", "停止后不会留下改了正式名字的半截文件;以后可以重试。")),
+                Some(t(
+                    "Unfinished copies stay as .part files, never under their real names; sending the same items again offers to resume them.",
+                    "未完成的部分会以 .part 文件保留,不会占用正式文件名;再次传输同样的内容时可以选择续传。",
+                )),
                 &[PromptButton::Ok(t("Stop and quit", "停止并退出").into()), PromptButton::Cancel(t("Cancel", "取消").into())],
                 cx,
             );
@@ -632,10 +648,8 @@ impl Workspace {
                 if answer.await == Ok(0) {
                     let _ = this.update_in(cx, |this, window, cx| {
                         this.quit_with_transfers = true;
-                        for (_, stop) in this.transfer_runs.values() {
-                            stop.store(true, Ordering::SeqCst);
-                        }
                         if this.request_close(window, cx) {
+                            this.abort_transfers();
                             cx.quit();
                         }
                     });
@@ -666,6 +680,7 @@ impl Workspace {
                 Ok(0) => this.preview.update(cx, |p, cx| p.save_all_then_quit(window, cx)),
                 Ok(1) => {
                     this.save_state(window, cx);
+                    this.abort_transfers();
                     cx.quit();
                 }
                 _ => {}
@@ -1803,8 +1818,9 @@ impl Workspace {
     }
 
     /// The file system for writing to machine `key`: the panel's if it shows that machine
-    /// writably, else this computer's or an ssh machine's (connecting if needed).
-    fn writable_fs(&mut self, key: &str, cx: &App) -> Option<Result<Arc<dyn files::FileSystem>, String>> {
+    /// writably, else this computer's or an ssh machine's (connected or to connect: the
+    /// address and the ssh command, run off the UI thread by the caller).
+    fn writable_fs(&mut self, key: &str, cx: &App) -> Option<Result<Arc<dyn files::FileSystem>, (String, Vec<String>)>> {
         let panel = self.files.read(cx);
         if panel.machine() == Some(key)
             && matches!(self.files_source, Some(Source::Local | Source::Sftp { .. }))
@@ -1817,7 +1833,7 @@ impl Workspace {
             Source::Local => Some(Ok(self.local_fs.clone())),
             Source::Sftp { address } => self.sftp.get(&address).cloned().map(Ok).or_else(|| {
                 let argv = rex_proto::transport::sftp_command(&address)?;
-                Some(files::sftp::SftpFs::spawn(argv).map(|s| Arc::new(s) as Arc<dyn files::FileSystem>).map_err(|e| crate::file_panel::fs_error_text(&e)))
+                Some(Err((address, argv)))
             }),
             _ => None,
         }
@@ -1826,35 +1842,68 @@ impl Workspace {
     /// The dialog's Start: resolve the target, look for names already there, ask, queue.
     fn start_transfer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Modal::Transfer { req, folder, target } = std::mem::replace(&mut self.modal, Modal::None) else { return };
-        let dir = folder.read(cx).value().trim().to_string();
+        let mut dir = folder.read(cx).value().trim().to_string();
         cx.notify();
-        if dir.is_empty() {
+        if req.direction == XferDirection::Download
+            && let Some(rest) = dir.strip_prefix('~')
+            && (rest.is_empty() || rest.starts_with('/'))
+            && let Ok(home) = std::env::var("HOME")
+        {
+            dir = format!("{home}{rest}");
+        }
+        if !dir.starts_with('/') {
+            self.banner = Some(t("The target folder has to be a full path, starting with /.", "目标目录需要是以 / 开头的完整路径。").into());
             return;
         }
-        let (dst_machine, dst_fs) = match req.direction {
+        // (machine, ready file system or the ssh connection to make)
+        let (dst_machine, dst) = match req.direction {
             XferDirection::Upload => {
                 let Some(key) = target else { return };
                 match self.writable_fs(&key, cx) {
-                    Some(Ok(fs)) => (key, fs),
-                    Some(Err(e)) => {
-                        self.banner = Some(e);
+                    Some(r) => (key, r),
+                    None => {
+                        self.banner = Some(t("Files on that machine can't be written from here.", "无法从这里写入该机器上的文件。").into());
                         return;
                     }
-                    None => return,
                 }
             }
             XferDirection::Download => {
                 let key = self.machines.iter().find(|m| m.spec.local).map(|m| m.spec.key.clone()).unwrap_or_else(|| "local".into());
-                (key, self.local_fs.clone())
+                (key, Ok(self.local_fs.clone()))
             }
         };
+        let download = req.direction == XferDirection::Download;
         let (src_fs, sources) = (req.src_fs.clone(), req.sources.clone());
-        let check_fs = dst_fs.clone();
         let d2 = dir.clone();
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+            let dst_fs = match dst {
+                Ok(fs) => fs,
+                Err((address, argv)) => {
+                    let made = cx
+                        .background_spawn(async move { files::sftp::SftpFs::spawn(argv).map(|s| Arc::new(s) as Arc<dyn files::FileSystem>) })
+                        .await;
+                    let Ok(ok) = this.update(cx, |this, cx| match made {
+                        Ok(fs) => Some(this.sftp.entry(address).or_insert(fs).clone()),
+                        Err(e) => {
+                            this.banner = Some(crate::file_panel::fs_error_text(&e));
+                            cx.notify();
+                            None
+                        }
+                    }) else {
+                        return;
+                    };
+                    let Some(fs) = ok else { return };
+                    fs
+                }
+            };
+            let check_fs = dst_fs.clone();
             // (source, name, exists, part left, a free name)
             let found = cx
                 .background_spawn(async move {
+                    // A download folder that isn't there yet is made.
+                    if download && check_fs.stat(&d2).is_err() {
+                        let _ = std::fs::create_dir_all(&d2);
+                    }
                     sources
                         .into_iter()
                         .map(|s| {
@@ -1940,14 +1989,14 @@ impl Workspace {
     /// Starts what may start, and the progress ticker while anything runs.
     fn pump_transfers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         while let Some(id) = self.transfers.next_to_start() {
-            let (Some(t), Some((src, dst))) = (self.transfers.get(id).cloned(), self.transfer_fs.get(&id).cloned()) else {
+            let (Some(job), Some((src, dst))) = (self.transfers.get(id).cloned(), self.transfer_fs.get(&id).cloned()) else {
                 self.transfers.finished(id, Err(t("Lost its machine.", "找不到机器。").into()));
                 continue;
             };
             let progress = Arc::new(Mutex::new((0u64, 0u64)));
-            let stop = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicU8::new(RUN_GO));
             self.transfer_runs.insert(id, (progress.clone(), stop.clone()));
-            let (job, resume) = (t.job.clone(), t.resume);
+            let (job, resume) = (job.job.clone(), job.resume);
             self.tasks.push(cx.spawn_in(window, async move |this, cx| {
                 let result = cx.background_spawn(async move { run_transfer(&*src, &*dst, &job, resume, &progress, &stop) }).await;
                 let _ = this.update_in(cx, |this, window, cx| {
@@ -1956,7 +2005,12 @@ impl Workspace {
                         let (done, total) = *p.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         this.transfers.progress(id, done, total, Instant::now());
                     }
-                    this.transfers.finished(id, result);
+                    if let Ok(n) = result
+                        && n > 0
+                    {
+                        this.transfers.set_note(id, format!("{n} {}", t("links or special files skipped", "个链接或特殊文件已跳过")));
+                    }
+                    this.transfers.finished(id, result.map(|_| ()));
                     this.after_transfer(id, cx);
                     this.pump_transfers(window, cx);
                     cx.notify();
@@ -2010,9 +2064,16 @@ impl Workspace {
         if self.transfers.cancel(id)
             && let Some((_, stop)) = self.transfer_runs.get(&id)
         {
-            stop.store(true, Ordering::SeqCst);
+            stop.store(RUN_CANCEL, Ordering::SeqCst);
         }
         cx.notify();
+    }
+
+    /// Quitting: running copies stop and keep their parts.
+    fn abort_transfers(&self) {
+        for (_, stop) in self.transfer_runs.values() {
+            stop.store(RUN_ABORT, Ordering::SeqCst);
+        }
     }
 
     fn machine_name(&self, key: &str) -> String {
@@ -2035,7 +2096,10 @@ impl Workspace {
             let status = match &t.state {
                 XferState::Queued => t_("Waiting", "等待中").to_string(),
                 XferState::Running => format!("{} / {} · {}/s", human(t.done), human(t.total), human(t.speed as u64)),
-                XferState::Done => format!("{} · {}", t_("Done", "完成"), human(t.total)),
+                XferState::Done => match &t.note {
+                    Some(n) => format!("{} · {} · {n}", t_("Done", "完成"), human(t.total)),
+                    None => format!("{} · {}", t_("Done", "完成"), human(t.total)),
+                },
                 XferState::Failed(why) => format!("{} {why}", t_("Failed:", "失败:")),
                 XferState::Canceled => t_("Canceled", "已取消").to_string(),
             };
@@ -2079,6 +2143,8 @@ impl Workspace {
             .child(div().flex_1())
             .child(Button::new("xfer-clear").ghost().size(ButtonSize::Xs).label(t("Clear finished", "清除已完成")).on_click(cx.listener(|this, _, _, cx| {
                 this.transfers.clear_finished();
+                let left: std::collections::HashSet<TransferId> = this.transfers.items().iter().map(|t| t.id).collect();
+                this.transfer_fs.retain(|id, _| left.contains(id));
                 cx.notify();
             })))
             .child(Button::new("xfer-hide").ghost().size(ButtonSize::Xs).icon(IconName::X).tooltip(t("Hide", "隐藏")).on_click(cx.listener(|this, _, _, cx| {

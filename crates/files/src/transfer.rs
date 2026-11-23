@@ -10,10 +10,21 @@ pub struct Progress {
     pub total: u64,
 }
 
+/// What the progress callback says: go on, stop and throw the part away, or stop and keep
+/// it for a later resume (the app is quitting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    Go,
+    Cancel,
+    Abort,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopyError {
     /// Stopped by the caller; the part file is gone.
     Canceled,
+    /// Stopped by the caller; the part file is kept for a resume.
+    Aborted,
     /// The target exists (and wasn't to be overwritten); the part file is kept.
     Exists,
     Fs(FsError),
@@ -48,7 +59,11 @@ pub fn part_path(path: &str) -> String {
 /// What copying `path` takes: the file, or the folder and everything in it (links and
 /// special files are left out and counted).
 pub fn plan_tree(fs: &dyn FileSystem, path: &str) -> Result<Plan, FsError> {
-    let top = fs.stat(path)?;
+    // A link given itself is followed (links inside a folder are not).
+    let top = match fs.stat(path)? {
+        e if matches!(e.kind, Kind::Symlink { .. }) => fs.stat_target(path)?,
+        e => e,
+    };
     let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or(path).to_string();
     let mut plan = Plan::default();
     match top.kind {
@@ -91,8 +106,8 @@ fn walk(fs: &dyn FileSystem, dir: &str, rel: &str, plan: &mut Plan) -> Result<()
 const WRITE_PIECE: usize = 1 << 20;
 
 /// Copies one file to `dst_path` through `dst_path.part`: continuing from the part's size
-/// with `resume`, from scratch otherwise. `on` hears the progress and stops the copy by
-/// returning false. The part becomes the file by rename: `overwrite` replaces a file there,
+/// with `resume`, from scratch otherwise. `on` hears the progress and can stop the copy
+/// (see [`Flow`]). The part becomes the file by rename: `overwrite` replaces a file there,
 /// else Exists (the part stays for a retry).
 pub fn copy_file(
     src: &dyn FileSystem,
@@ -101,9 +116,17 @@ pub fn copy_file(
     dst_path: &str,
     resume: bool,
     overwrite: bool,
-    on: &mut dyn FnMut(Progress) -> bool,
+    on: &mut dyn FnMut(Progress) -> Flow,
 ) -> Result<u64, CopyError> {
     let part = part_path(dst_path);
+    let stopped = |flow: Flow| {
+        if flow == Flow::Abort {
+            CopyError::Aborted
+        } else {
+            let _ = dst.remove(&part);
+            CopyError::Canceled
+        }
+    };
     let total = src.stat_target(src_path).map_err(CopyError::Fs)?.size.unwrap_or(0);
     let mut start = if resume { dst.stat(&part).ok().and_then(|e| e.size).unwrap_or(0) } else { 0 };
     if !resume || start > total {
@@ -116,14 +139,14 @@ pub fn copy_file(
     if start == 0 {
         dst.write_chunk(&part, 0, &[]).map_err(CopyError::Fs)?;
     }
-    if !on(Progress { done: start, total }) {
-        let _ = dst.remove(&part);
-        return Err(CopyError::Canceled);
+    match on(Progress { done: start, total }) {
+        Flow::Go => {}
+        f => return Err(stopped(f)),
     }
     let mut at = start;
     let mut buf: Vec<u8> = Vec::with_capacity(WRITE_PIECE);
     let mut failed: Option<FsError> = None;
-    let mut canceled = false;
+    let mut halt = Flow::Go;
     let flush = |buf: &mut Vec<u8>, at: &mut u64| -> Result<(), FsError> {
         if !buf.is_empty() {
             dst.write_chunk(&part, *at, buf)?;
@@ -139,8 +162,8 @@ pub fn copy_file(
                 failed = Some(e);
                 return false;
             }
-            if !on(Progress { done: at, total }) {
-                canceled = true;
+            halt = on(Progress { done: at, total });
+            if halt != Flow::Go {
                 return false;
             }
         }
@@ -149,21 +172,24 @@ pub fn copy_file(
     if let Err(e) = read {
         return Err(CopyError::Fs(e));
     }
-    if canceled {
-        let _ = dst.remove(&part);
-        return Err(CopyError::Canceled);
+    if halt != Flow::Go {
+        return Err(stopped(halt));
     }
     if let Some(e) = failed {
         return Err(CopyError::Fs(e));
     }
     flush(&mut buf, &mut at).map_err(CopyError::Fs)?;
-    if !on(Progress { done: at, total }) {
-        let _ = dst.remove(&part);
-        return Err(CopyError::Canceled);
+    match on(Progress { done: at, total }) {
+        Flow::Go => {}
+        f => return Err(stopped(f)),
     }
     let done = if overwrite {
         match dst.replace(&part, dst_path) {
             Err(FsError::Unsupported(_)) => {
+                // Without an atomic replace: remove the old file first, never a folder.
+                if dst.stat(dst_path).is_ok_and(|e| matches!(e.kind, Kind::Dir | Kind::Symlink { .. })) {
+                    return Err(CopyError::Exists);
+                }
                 match dst.remove(dst_path) {
                     Ok(()) | Err(FsError::NotFound) => {}
                     Err(e) => return Err(CopyError::Fs(e)),
@@ -194,7 +220,7 @@ pub fn copy_tree(
     dst_top: &str,
     plan: &Plan,
     overwrite: bool,
-    on: &mut dyn FnMut(Progress) -> bool,
+    on: &mut dyn FnMut(Progress) -> Flow,
 ) -> Result<u64, CopyError> {
     let top = plan.items.first().map(|i| i.rel.clone()).unwrap_or_default();
     let src_base = crate::parent(src_path.trim_end_matches('/')).unwrap_or_else(|| "/".into());
@@ -230,8 +256,9 @@ pub fn unique_name(exists: impl Fn(&str) -> bool, name: &str) -> String {
         return name.to_string();
     }
     // The extension starts at the first dot after the first character (".env" has none).
-    let (stem, ext) = match name[1.min(name.len())..].find('.') {
-        Some(i) => name.split_at(i + 1),
+    let first = name.chars().next().map_or(0, char::len_utf8);
+    let (stem, ext) = match name[first..].find('.') {
+        Some(i) => name.split_at(i + first),
         None => (name, ""),
     };
     (1..)
@@ -267,7 +294,7 @@ pub(crate) mod tests {
         let mut last = Progress { done: 0, total: 0 };
         assert_eq!(copy_file(src, &s, dst, &d, false, false, &mut |p| {
             last = p;
-            true
+            Flow::Go
         }), Ok(bytes.len() as u64));
         assert_eq!(fs::read(&d).unwrap(), bytes);
         assert_eq!(last, Progress { done: bytes.len() as u64, total: bytes.len() as u64 });
@@ -275,7 +302,7 @@ pub(crate) mod tests {
 
         // An empty file.
         fs::write(format!("{src_root}/empty"), b"").unwrap();
-        copy_file(src, &format!("{src_root}/empty"), dst, &format!("{dst_root}/empty"), false, false, &mut |_| true).unwrap();
+        copy_file(src, &format!("{src_root}/empty"), dst, &format!("{dst_root}/empty"), false, false, &mut |_| Flow::Go).unwrap();
         assert_eq!(fs::read(format!("{dst_root}/empty")).unwrap(), b"");
 
         // Resume from half a part: byte-identical, nothing written twice.
@@ -284,7 +311,7 @@ pub(crate) mod tests {
         let mut first = None;
         copy_file(src, &s, dst, &r, true, false, &mut |p| {
             first.get_or_insert(p.done);
-            true
+            Flow::Go
         })
         .unwrap();
         assert_eq!(fs::read(&r).unwrap(), bytes);
@@ -292,16 +319,16 @@ pub(crate) mod tests {
 
         // Canceled: no file, no part.
         let c = format!("{dst_root}/canceled.bin");
-        assert_eq!(copy_file(src, &s, dst, &c, false, false, &mut |p| p.done < 1_000_000), Err(CopyError::Canceled));
+        assert_eq!(copy_file(src, &s, dst, &c, false, false, &mut |p| if p.done < 1_000_000 { Flow::Go } else { Flow::Cancel }), Err(CopyError::Canceled));
         assert!(!std::path::Path::new(&c).exists() && !std::path::Path::new(&part_path(&c)).exists());
 
         // The target appeared: refused, the part kept for a retry; overwrite replaces it.
         let t = format!("{dst_root}/taken.bin");
         fs::write(&t, b"theirs").unwrap();
-        assert_eq!(copy_file(src, &s, dst, &t, false, false, &mut |_| true), Err(CopyError::Exists));
+        assert_eq!(copy_file(src, &s, dst, &t, false, false, &mut |_| Flow::Go), Err(CopyError::Exists));
         assert_eq!(fs::read(&t).unwrap(), b"theirs");
         assert!(std::path::Path::new(&part_path(&t)).exists());
-        copy_file(src, &s, dst, &t, true, true, &mut |_| true).unwrap();
+        copy_file(src, &s, dst, &t, true, true, &mut |_| Flow::Go).unwrap();
         assert_eq!(fs::read(&t).unwrap(), bytes);
 
         // A tree: nested and empty folders kept, a link skipped.
@@ -314,16 +341,16 @@ pub(crate) mod tests {
         let plan = plan_tree(src, &tree).unwrap();
         assert_eq!(plan.skipped, 1);
         assert_eq!(plan.total, 12);
-        copy_tree(src, &tree, dst, dst_root, "proj dir", &plan, false, &mut |_| true).unwrap();
+        copy_tree(src, &tree, dst, dst_root, "proj dir", &plan, false, &mut |_| Flow::Go).unwrap();
         assert_eq!(fs::read(format!("{dst_root}/proj dir/src/deep/a.rs")).unwrap(), b"fn a() {}");
         assert_eq!(fs::read(format!("{dst_root}/proj dir/.env")).unwrap(), b"K=1");
         assert!(std::path::Path::new(&format!("{dst_root}/proj dir/empty")).is_dir());
         assert!(!std::path::Path::new(&format!("{dst_root}/proj dir/etc-link")).exists());
         // Kept both: the same tree under another name.
-        copy_tree(src, &tree, dst, dst_root, "proj dir (1)", &plan, false, &mut |_| true).unwrap();
+        copy_tree(src, &tree, dst, dst_root, "proj dir (1)", &plan, false, &mut |_| Flow::Go).unwrap();
         assert_eq!(fs::read(format!("{dst_root}/proj dir (1)/src/deep/a.rs")).unwrap(), b"fn a() {}");
         // Again (a retry): what's there is left alone, nothing fails.
-        copy_tree(src, &tree, dst, dst_root, "proj dir", &plan, false, &mut |_| true).unwrap();
+        copy_tree(src, &tree, dst, dst_root, "proj dir", &plan, false, &mut |_| Flow::Go).unwrap();
     }
 
     #[test]
@@ -332,7 +359,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_link_at_the_top_is_followed() {
+        let r = root("toplink");
+        let d = root("toplink-dst");
+        fs::write(format!("{r}/app.tar"), b"payload").unwrap();
+        std::os::unix::fs::symlink(format!("{r}/app.tar"), format!("{r}/current")).unwrap();
+        let plan = plan_tree(&LocalFs, &format!("{r}/current")).unwrap();
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].kind, ItemKind::File);
+        copy_file(&LocalFs, &format!("{r}/current"), &LocalFs, &format!("{d}/current"), false, false, &mut |_| Flow::Go).unwrap();
+        assert_eq!(fs::read(format!("{d}/current")).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn overwrite_without_atomic_rename_never_removes_a_folder() {
+        let r = root("nofold");
+        let d = root("nofold-dst");
+        fs::write(format!("{r}/build"), b"file").unwrap();
+        fs::create_dir(format!("{d}/build")).unwrap();
+        fs::write(format!("{d}/build/keep.o"), b"keep").unwrap();
+        let dst = crate::save::tests::Twist::replace_fails(FsError::Unsupported("no".into()));
+        assert!(copy_file(&LocalFs, &format!("{r}/build"), &dst, &format!("{d}/build"), false, true, &mut |_| Flow::Go).is_err());
+        assert_eq!(fs::read(format!("{d}/build/keep.o")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn abort_keeps_the_part() {
+        let r = root("abort");
+        let d = root("abort-dst");
+        fs::write(format!("{r}/f"), data(3_000_000)).unwrap();
+        let to = format!("{d}/f");
+        assert_eq!(copy_file(&LocalFs, &format!("{r}/f"), &LocalFs, &to, false, false, &mut |p| if p.done < 1_000_000 { Flow::Go } else { Flow::Abort }), Err(CopyError::Aborted));
+        assert!(fs::metadata(part_path(&to)).unwrap().len() >= 1_000_000);
+        copy_file(&LocalFs, &format!("{r}/f"), &LocalFs, &to, true, false, &mut |_| Flow::Go).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), data(3_000_000));
+    }
+
+    #[test]
     fn unique_names() {
+        assert_eq!(unique_name(|n| n == "中文.txt", "中文.txt"), "中文 (1).txt");
+        assert_eq!(unique_name(|n| n == "é", "é"), "é (1)");
         let taken = ["a.txt", "a (1).txt", ".env", "archive.tar.gz"];
         let exists = |n: &str| taken.contains(&n);
         assert_eq!(unique_name(exists, "a.txt"), "a (2).txt");

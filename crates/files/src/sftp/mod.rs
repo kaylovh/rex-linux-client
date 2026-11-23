@@ -684,6 +684,29 @@ mod tests {
     }
 
     #[test]
+    fn an_upload_cut_mid_file_resumes_byte_identical() {
+        use crate::transfer::{Flow, copy_file, part_path};
+        let root = temp_root("cut");
+        let Some(argv) = server_argv(&root) else { return };
+        let fs = SftpFs::spawn(argv).unwrap();
+        let src = crate::transfer::tests::root("cut-src");
+        let bytes: Vec<u8> = (0..4_000_000u32).map(|i| (i.wrapping_mul(97) >> 3) as u8).collect();
+        std::fs::write(format!("{src}/f.bin"), &bytes).unwrap();
+        let to = format!("{root}/f.bin");
+        let r = copy_file(&crate::local::LocalFs, &format!("{src}/f.bin"), &fs, &to, false, false, &mut |p| {
+            if p.done >= 1_000_000 {
+                fs.kill_for_test();
+            }
+            Flow::Go
+        });
+        assert!(matches!(r, Err(crate::transfer::CopyError::Fs(_))), "{r:?}");
+        let kept = std::fs::metadata(part_path(&to)).unwrap().len();
+        assert!(kept >= 1_000_000 && kept < 4_000_000, "{kept}");
+        copy_file(&crate::local::LocalFs, &format!("{src}/f.bin"), &fs, &to, true, false, &mut |_| Flow::Go).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), bytes);
+    }
+
+    #[test]
     fn dead_server_is_gone_then_respawns() {
         let root = temp_root("dead");
         let Some(argv) = server_argv(&root) else { return };

@@ -359,9 +359,9 @@ pub(crate) mod tests {
 
     /// Local files with one thing changed.
     #[derive(Default)]
-    struct Twist {
-        other_owner: bool,
-        replace: Option<FsError>,
+    pub(crate) struct Twist {
+        pub(crate) other_owner: bool,
+        pub(crate) replace: Option<FsError>,
         fail_set_mode: bool,
         fail_remove: bool,
         /// Creating the temp says something is already there.
@@ -372,6 +372,12 @@ pub(crate) mod tests {
         /// stat_target fails once the replace happened.
         lose_after_replace: bool,
         replaced: AtomicBool,
+    }
+
+    impl Twist {
+        pub(crate) fn replace_fails(e: FsError) -> Self {
+            Twist { replace: Some(e), ..Default::default() }
+        }
     }
 
     impl FileSystem for Twist {
@@ -414,6 +420,8 @@ pub(crate) mod tests {
             if self.fail_set_mode { Err(FsError::Gone("cut".into())) } else { LocalFs.set_mode(p, m) }
         }
         fn link_count(&self, p: &str) -> Result<Option<u64>, FsError> { LocalFs.link_count(p) }
+        fn read_chunk(&self, p: &str, o: u64, n: usize) -> Result<Vec<u8>, FsError> { LocalFs.read_chunk(p, o, n) }
+        fn write_chunk(&self, p: &str, o: u64, b: &[u8]) -> Result<(), FsError> { LocalFs.write_chunk(p, o, b) }
         fn replace(&self, a: &str, b: &str) -> Result<(), FsError> {
             match &self.replace {
                 Some(e) => Err(e.clone()),
