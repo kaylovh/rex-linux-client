@@ -672,6 +672,18 @@ mod tests {
     }
 
     #[test]
+    fn copies_to_and_from_sftp() {
+        let up = temp_root("up");
+        let Some(argv) = server_argv(&up) else { return };
+        let fs = SftpFs::spawn(argv).unwrap();
+        let local_src = crate::transfer::tests::root("up-src");
+        crate::transfer::tests::copy_cases(&crate::local::LocalFs, &local_src, &fs, &up);
+        let down = crate::transfer::tests::root("down-dst");
+        let remote_src = temp_root("down-src");
+        crate::transfer::tests::copy_cases(&fs, &remote_src, &crate::local::LocalFs, &down);
+    }
+
+    #[test]
     fn dead_server_is_gone_then_respawns() {
         let root = temp_root("dead");
         let Some(argv) = server_argv(&root) else { return };
