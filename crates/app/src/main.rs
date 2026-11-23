@@ -6,6 +6,7 @@
 
 mod config;
 mod fonts;
+mod hosts;
 mod i18n;
 mod keys;
 mod machines;

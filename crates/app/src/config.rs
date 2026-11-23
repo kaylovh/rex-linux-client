@@ -23,6 +23,16 @@ pub struct MachineConfig {
     pub endpoint: String,
 }
 
+/// Which of a server's own Rex hosts the sidebar shows (a server with no entry: all for
+/// this computer, none for a remote one).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShownHosts {
+    /// The machine key of the server listing them.
+    pub server: String,
+    /// Their labels.
+    pub hosts: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FontSettings {
@@ -37,6 +47,7 @@ pub struct Settings {
     pub language: Language,
     pub machines: Vec<MachineConfig>,
     pub font: FontSettings,
+    pub shown_hosts: Vec<ShownHosts>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -154,6 +165,7 @@ mod tests {
             language: Language::Zh,
             machines: vec![MachineConfig { name: "dev".into(), endpoint: "ssh://dev".into() }],
             font: FontSettings { family: Some("Iosevka".into()), size: Some(15.0), fallbacks: vec!["Noto Color Emoji".into()] },
+            shown_hosts: vec![ShownHosts { server: "local".into(), hosts: vec!["studio".into()] }],
         };
         save_settings(&d, &s, false).unwrap();
         assert_eq!(load_settings(&d), (s, None));

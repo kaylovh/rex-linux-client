@@ -8,7 +8,8 @@ use gpui_kit::{
 };
 use rexterm::terminal::{TerminalAppearance, TerminalConfig};
 
-use crate::config::{FontSettings, Language, MachineConfig, Settings};
+use crate::config::{FontSettings, Language, MachineConfig, Settings, ShownHosts};
+use crate::hosts::{shown_for, toggle_shown};
 use crate::i18n::t;
 use crate::machines::validate_machine;
 
@@ -41,6 +42,14 @@ pub fn parse_font(family: &str, size: &str, fallbacks: &str) -> Result<FontSetti
     Ok(FontSettings { family, size, fallbacks })
 }
 
+/// One server's Rex hosts, for choosing which the sidebar shows.
+pub struct HostGroup {
+    pub server: String,
+    pub name: String,
+    pub labels: Vec<String>,
+    pub default_visible: bool,
+}
+
 pub enum SettingsEvent {
     Save(Settings),
     Cancel,
@@ -48,7 +57,6 @@ pub enum SettingsEvent {
 
 /// The dialog's fields, edited in place until Save.
 pub struct SettingsView {
-    base: Settings,
     language: Language,
     machines: Vec<MachineConfig>,
     /// The machine is pinned with -S: the list is shown but not edited here.
@@ -60,6 +68,8 @@ pub struct SettingsView {
     new_endpoint: Entity<InputState>,
     error: Option<String>,
     focus: FocusHandle,
+    host_groups: Vec<HostGroup>,
+    shown_hosts: Vec<ShownHosts>,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -71,13 +81,12 @@ impl Focusable for SettingsView {
 }
 
 impl SettingsView {
-    pub fn new(settings: &Settings, pinned: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(settings: &Settings, pinned: bool, host_groups: Vec<HostGroup>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = |value: String, placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(value))
         };
         let f = &settings.font;
         Self {
-            base: settings.clone(),
             language: settings.language,
             machines: settings.machines.clone(),
             pinned,
@@ -88,7 +97,21 @@ impl SettingsView {
             new_endpoint: input(String::new(), "ssh://user@host", window, cx),
             error: None,
             focus: cx.focus_handle(),
+            host_groups,
+            shown_hosts: settings.shown_hosts.clone(),
         }
+    }
+
+    fn host_visible(&self, group: &HostGroup, label: &str) -> bool {
+        shown_for(&self.shown_hosts, &group.server).map_or(group.default_visible, |s| s.iter().any(|l| l == label))
+    }
+
+    fn toggle_host(&mut self, group: usize, label: &str, cx: &mut Context<Self>) {
+        let Some(g) = self.host_groups.get(group) else { return };
+        let visible: Vec<String> = g.labels.iter().filter(|l| self.host_visible(g, l)).cloned().collect();
+        let server = g.server.clone();
+        toggle_shown(&mut self.shown_hosts, &server, label, &visible);
+        cx.notify();
     }
 
     pub fn set_error(&mut self, error: String, cx: &mut Context<Self>) {
@@ -115,7 +138,7 @@ impl SettingsView {
         let read = |e: &Entity<InputState>, cx: &Context<Self>| e.read(cx).value().to_string();
         match parse_font(&read(&self.family, cx), &read(&self.size, cx), &read(&self.fallbacks, cx)) {
             Ok(font) => {
-                let s = Settings { language: self.language, machines: self.machines.clone(), font, ..self.base.clone() };
+                let s = Settings { language: self.language, machines: self.machines.clone(), font, shown_hosts: self.shown_hosts.clone() };
                 self.error = None;
                 cx.emit(SettingsEvent::Save(s));
             }
@@ -199,6 +222,19 @@ impl Render for SettingsView {
             )
             .child(Self::section(t("Machines", "机器")))
             .child(machines)
+            .children((!self.host_groups.is_empty()).then(|| Self::section(t("Rex hosts shown in the sidebar", "侧栏显示的 Rex hosts"))))
+            .children(self.host_groups.iter().enumerate().map(|(gi, g)| {
+                let mut row = div().flex().flex_wrap().items_center().gap_2().child(div().w(px(110.)).text_sm().child(g.name.clone()));
+                for (li, label) in g.labels.iter().enumerate() {
+                    let on = self.host_visible(g, label);
+                    let l = label.clone();
+                    let b = Button::new(SharedString::from(format!("host-{gi}-{li}")))
+                        .label(label.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_host(gi, &l, cx)));
+                    row = row.child(if on { b.primary() } else { b.outline() });
+                }
+                row
+            }))
             .child(Self::section(t("Terminal font", "终端字体")))
             .child(field(t("Family", "字体"), &self.family))
             .child(field(t("Size", "字号"), &self.size))

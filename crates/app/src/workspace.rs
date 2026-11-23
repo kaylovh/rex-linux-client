@@ -25,13 +25,14 @@ use rexterm::terminal::{Terminal, TerminalState};
 use serde_json::{Value, json};
 
 use crate::config::{self, Settings, WorkspaceState};
+use crate::hosts::{HostEntry, host_specs, parse_hosts, shown_by_default, shown_for};
 use crate::i18n::t;
 use crate::keys::gui_command;
 use crate::machines::{ConnState, MachineSpec, StartChoice, after_reconnect, start_choice, state_target, status_line};
 use crate::palette::{PaletteAction, PaletteEntry, PaletteSession, palette_entries, session_name};
 use crate::machines::machine_specs;
 use crate::panes::{PaneEntry, PaneSet, PaneStatus, diff};
-use crate::settings_view::{SettingsEvent, SettingsView, terminal_config};
+use crate::settings_view::{HostGroup, SettingsEvent, SettingsView, terminal_config};
 
 const SHELL: &str = "com.superlogical.terminal.shell";
 
@@ -39,8 +40,17 @@ fn shell_layout() -> Value {
     json!({"block": {"flavor": SHELL}})
 }
 
-/// Connects, lists the sessions and subscribes to every session's events. Blocks.
-fn connect(endpoint: rex_proto::transport::Endpoint) -> Result<(Arc<Control>, Vec<SessionInfo>), String> {
+/// What a connect learns besides the sessions: the server's host_id and its Rex hosts.
+struct Learned {
+    host_id: Option<String>,
+    hosts: Vec<HostEntry>,
+}
+
+type Connected = (Arc<Control>, Vec<SessionInfo>, Learned);
+
+/// Connects, lists the sessions (and, with `want_hosts`, the server's Rex hosts) and
+/// subscribes to every session's events. Blocks.
+fn connect(endpoint: rex_proto::transport::Endpoint, want_hosts: bool) -> Result<Connected, String> {
     let control = Control::connect(endpoint, "rexa-desktop").map_err(|e| e.to_string())?;
     let list = control.call("session.list", json!({})).map_err(|e| e.to_string())?;
     let sessions = list["sessions"]
@@ -51,7 +61,13 @@ fn connect(endpoint: rex_proto::transport::Endpoint) -> Result<(Arc<Control>, Ve
         .collect();
     // Every session's events (status badges for the sessions not shown too).
     let _ = control.call("session.attach_all", json!({"event_scope": "all"}));
-    Ok((control, sessions))
+    let host_id = control.call("server.status", json!({})).ok().and_then(|s| s["host_id"].as_str().map(str::to_string));
+    let hosts = if want_hosts { list_hosts(&control) } else { Vec::new() };
+    Ok((control, sessions, Learned { host_id, hosts }))
+}
+
+fn list_hosts(control: &Control) -> Vec<HostEntry> {
+    control.call("hosts.list", json!({})).map(|v| parse_hosts(&v)).unwrap_or_default()
 }
 
 /// The program status records of every terminal block in every session, for the sidebar.
@@ -113,7 +129,16 @@ struct Machine {
     control: Option<Arc<Control>>,
     model: SessionModel,
     conn: ConnState,
+    /// What its server said about itself, and its Rex hosts (not loaded for a host).
+    host_id: Option<String>,
+    hosts: Vec<HostEntry>,
     tasks: Vec<Task<()>>,
+}
+
+impl Machine {
+    fn new(spec: MachineSpec) -> Self {
+        Machine { spec, control: None, model: SessionModel::default(), conn: ConnState::Connecting, host_id: None, hosts: Vec::new(), tasks: Vec::new() }
+    }
 }
 
 /// A dialog over the window.
@@ -197,7 +222,7 @@ impl Workspace {
             machines: init
                 .specs
                 .into_iter()
-                .map(|spec| Machine { spec, control: None, model: SessionModel::default(), conn: ConnState::Connecting, tasks: Vec::new() })
+                .map(Machine::new)
                 .collect(),
             shown: None,
             start: Some(Start { machine: Some(init.start.0), session: init.start.1, strict: init.strict }),
@@ -280,9 +305,10 @@ impl Workspace {
             old.close();
         }
         let endpoint = m.spec.endpoint.clone();
+        let want_hosts = m.spec.parent.is_none();
         let k = key.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move { connect(endpoint) }).await;
+            let result = cx.background_spawn(async move { connect(endpoint, want_hosts) }).await;
             let _ = this.update_in(cx, |this, window, cx| this.machine_connected(&k, result, window, cx));
         });
         if let Some(m) = self.machine_mut(&key) {
@@ -294,7 +320,7 @@ impl Workspace {
     fn machine_connected(
         &mut self,
         key: &str,
-        result: Result<(Arc<Control>, Vec<SessionInfo>), String>,
+        result: Result<Connected, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -319,8 +345,10 @@ impl Workspace {
                     }
                 }
             }
-            Ok((control, sessions)) => {
+            Ok((control, sessions, learned)) => {
                 m.conn = ConnState::Connected;
+                m.host_id = learned.host_id;
+                m.hosts = learned.hosts;
                 let previous = m.model.current.take();
                 m.model = SessionModel::default();
                 m.model.sessions = sessions.clone();
@@ -347,6 +375,7 @@ impl Workspace {
                         cx.notify();
                     });
                 }));
+                self.sync_hosts(window, cx);
                 if self.shown.as_deref() == Some(key) {
                     // The shown machine connected anew (Retry after a drop): its old panes
                     // belong to the closed connection; show the same session again.
@@ -782,6 +811,20 @@ impl Workspace {
                 }
             }
             Some("rexa_disconnected") => m.conn = ConnState::Failed(t("disconnected", "连接已断开").into()),
+            Some("hosts_changed") if m.spec.parent.is_none() => {
+                if let Some(c) = m.control.clone() {
+                    let k = key.to_string();
+                    self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+                        let hosts = cx.background_spawn(async move { list_hosts(&c) }).await;
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            if let Some(m) = this.machine_mut(&k) {
+                                m.hosts = hosts;
+                            }
+                            this.sync_hosts(window, cx);
+                        });
+                    }));
+                }
+            }
             _ => match m.model.apply_event(&ev) {
                 Effect::RefetchView(_) if shown => self.refetch_view(window, cx),
                 Effect::SessionsChanged if shown => {
@@ -1152,7 +1195,18 @@ impl Workspace {
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pinned = self.machines.first().is_some_and(|m| m.spec.key == "cli");
         let settings = self.settings.clone();
-        let view = cx.new(|cx| SettingsView::new(&settings, pinned, window, cx));
+        let groups: Vec<HostGroup> = self
+            .machines
+            .iter()
+            .filter(|m| m.spec.parent.is_none() && m.conn == ConnState::Connected && !m.hosts.is_empty())
+            .map(|m| HostGroup {
+                server: m.spec.key.clone(),
+                name: m.spec.name.clone(),
+                labels: m.hosts.iter().map(|h| h.label.clone()).collect(),
+                default_visible: shown_by_default(&m.spec),
+            })
+            .collect();
+        let view = cx.new(|cx| SettingsView::new(&settings, pinned, groups, window, cx));
         let sub = cx.subscribe_in(&view, window, |this, view, ev: &SettingsEvent, window, cx| match ev {
             SettingsEvent::Cancel => this.close_settings(window, cx),
             SettingsEvent::Save(s) => {
@@ -1196,10 +1250,39 @@ impl Workspace {
         let pinned = self.machines.first().is_some_and(|m| m.spec.key == "cli");
         if !pinned && let Some(local) = self.machines.iter().find(|m| m.spec.local).map(|m| m.spec.endpoint.clone()) {
             let (specs, _) = machine_specs(None, &self.settings, local);
-            self.set_machines(specs, window, cx);
+            let all = self.with_hosts(specs);
+            self.set_machines(all, window, cx);
+        } else {
+            self.sync_hosts(window, cx);
         }
         cx.refresh_windows();
         Ok(())
+    }
+
+    /// `base` (machines that aren't Rex hosts) with each one's shown hosts right after it.
+    fn with_hosts(&self, base: Vec<MachineSpec>) -> Vec<MachineSpec> {
+        let known: Vec<String> = self.machines.iter().filter(|m| m.spec.parent.is_none()).filter_map(|m| m.host_id.clone()).collect();
+        let mut out = Vec::new();
+        for spec in base {
+            let hosts = self
+                .machine(&spec.key)
+                .filter(|m| m.conn == ConnState::Connected)
+                .map(|m| host_specs(&spec, &m.hosts, shown_for(&self.settings.shown_hosts, &spec.key), &known))
+                .unwrap_or_default();
+            out.push(spec);
+            out.extend(hosts);
+        }
+        out
+    }
+
+    /// Brings the Rex host machines in line with what the servers list and the settings show.
+    fn sync_hosts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let base: Vec<MachineSpec> = self.machines.iter().filter(|m| m.spec.parent.is_none()).map(|m| m.spec.clone()).collect();
+        let all = self.with_hosts(base);
+        let same = all.len() == self.machines.len() && all.iter().zip(&self.machines).all(|(a, m)| a.key == m.spec.key && a.address == m.spec.address);
+        if !same {
+            self.set_machines(all, window, cx);
+        }
     }
 
     /// Follows a new machine list: connects the new ones, drops the removed ones (showing
@@ -1227,7 +1310,7 @@ impl Workspace {
                 }
                 _ => {
                     reconnect.push(spec.key.clone());
-                    self.machines.push(Machine { spec, control: None, model: SessionModel::default(), conn: ConnState::Connecting, tasks: Vec::new() });
+                    self.machines.push(Machine::new(spec));
                 }
             }
         }
@@ -1240,7 +1323,10 @@ impl Workspace {
             self.connect_machine(k, window, cx);
         }
         if self.shown.is_none() {
-            self.start = Some(Start { machine: None, session: None, strict: false });
+            // Keep a start target still waiting for its machine (a restore, a -S session).
+            if self.start.is_none() {
+                self.start = Some(Start { machine: None, session: None, strict: false });
+            }
             if let Some(k) = self.machines.iter().find(|m| m.conn == ConnState::Connected).map(|m| m.spec.key.clone()) {
                 self.maybe_start(&k, window, cx);
             }
@@ -1317,9 +1403,17 @@ impl Workspace {
         let mut bar = Sidebar::new();
         for m in &self.machines {
             let key = m.spec.key.clone();
+            let via = m
+                .spec
+                .parent
+                .as_deref()
+                .and_then(|p| self.machine(p))
+                .filter(|p| !p.spec.local)
+                .map(|p| format!(" ({} {})", t("via", "经"), p.spec.name))
+                .unwrap_or_default();
             let mut group = SidebarGroup::new().id(SharedString::from(format!("machine-{key}"))).label(match m.conn.text() {
-                Some(s) => format!("{} · {s}", m.spec.name),
-                None => m.spec.name.clone(),
+                Some(s) => format!("{}{via} · {s}", m.spec.name),
+                None => format!("{}{via}", m.spec.name),
             });
             if matches!(m.conn, ConnState::Failed(_)) {
                 let k = key.clone();

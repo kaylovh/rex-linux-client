@@ -15,6 +15,11 @@ pub struct MachineSpec {
     pub name: String,
     pub endpoint: Endpoint,
     pub local: bool,
+    /// The address as typed (`-S` text, the settings' endpoint, or the one built for a Rex
+    /// host); empty for this computer.
+    pub address: String,
+    /// For a Rex host: the key of the machine whose server lists it.
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,16 +40,16 @@ pub enum ConnState {
 /// The machines to show and the configured ones that were left out, as "name: reason".
 pub fn machine_specs(cli: Option<(String, Endpoint)>, settings: &Settings, local: Endpoint) -> (Vec<MachineSpec>, Vec<String>) {
     if let Some((text, endpoint)) = cli {
-        return (vec![MachineSpec { key: "cli".into(), name: text, endpoint, local: false }], Vec::new());
+        return (vec![MachineSpec { key: "cli".into(), name: text.clone(), endpoint, local: false, address: text, parent: None }], Vec::new());
     }
-    let mut specs = vec![MachineSpec { key: "local".into(), name: t("This computer", "本机").into(), endpoint: local, local: true }];
+    let mut specs = vec![MachineSpec { key: "local".into(), name: t("This computer", "本机").into(), endpoint: local, local: true, address: String::new(), parent: None }];
     let mut warnings = Vec::new();
     let mut seen: Vec<&MachineConfig> = Vec::new();
     for m in &settings.machines {
         match validate_machine(&m.name, &m.endpoint, &seen.iter().map(|m| (*m).clone()).collect::<Vec<_>>()) {
             Ok(ok) => {
                 let endpoint = Endpoint::parse(&ok.endpoint).expect("validated");
-                specs.push(MachineSpec { key: format!("m:{}", ok.name), name: ok.name, endpoint, local: false });
+                specs.push(MachineSpec { key: format!("m:{}", ok.name), name: ok.name, endpoint, local: false, address: ok.endpoint, parent: None });
                 seen.push(m);
             }
             Err(e) => warnings.push(format!("{}: {}", m.name.trim(), e.text())),
