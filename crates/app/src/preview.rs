@@ -79,7 +79,15 @@ pub fn classify(name: &str, bytes: &[u8], size: u64) -> PreviewKind {
 }
 
 /// The highlighter for a file name, if one fits.
+/// Shown rendered (the source is a click away, editing is always the text).
+pub fn is_markdown(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && (ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")))
+}
+
 pub fn language_for(name: &str) -> Option<&'static str> {
+    if is_markdown(name) {
+        return Some("markdown");
+    }
     let lower = name.to_ascii_lowercase();
     if lower == ".env" || lower.starts_with(".env.") || matches!(lower.as_str(), ".bashrc" | ".zshrc" | ".profile" | ".bash_profile") {
         return Some("bash");
@@ -127,6 +135,8 @@ struct TextTab {
     saved: String,
     saving: bool,
     message: Option<String>,
+    /// A Markdown file shown rendered (not while editing).
+    rendered: Option<bool>,
     _sub: Subscription,
 }
 
@@ -641,7 +651,8 @@ fn text_tab(
             cx.notify();
         }
     });
-    TextTab { editor, note, block, editing: false, dirty: false, base, eol, saved: lf, saving: false, message: None, _sub: sub }
+    let rendered = (language == Some("markdown")).then_some(true);
+    TextTab { editor, note, block, editing: false, dirty: false, base, eol, saved: lf, saving: false, message: None, rendered, _sub: sub }
 }
 
 /// The unsaved files for a prompt: up to five names, then how many more.
@@ -727,6 +738,27 @@ impl Render for PreviewPanel {
                                 .on_click(cx.listener(move |this, _, window, cx| this.save(i, false, window, cx))),
                         )
                         .child(div().text_color(rgb(crate::theme::ui().muted)).child(main));
+                } else if let Some(r) = tt.rendered {
+                    bar = bar.child(
+                        Button::new("pv-md")
+                            .size(ButtonSize::Xs)
+                            .label(if r { t("Source", "源码") } else { t("Preview", "预览") })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(Content::Text(t)) = this.tabs.get_mut(i).map(|t| &mut t.content)
+                                    && let Some(r) = &mut t.rendered
+                                {
+                                    *r = !*r;
+                                }
+                                cx.notify();
+                            })),
+                    );
+                    if let Some(why) = &tt.block {
+                        bar = bar.child(div().text_color(rgb(crate::theme::ui().muted)).child(why.clone()));
+                    } else {
+                        bar = bar.child(
+                            Button::new("pv-edit").size(ButtonSize::Xs).label(t("Edit", "编辑")).on_click(cx.listener(move |this, _, window, cx| this.edit(i, window, cx))),
+                        );
+                    }
                 } else if let Some(why) = &tt.block {
                     bar = bar.child(div().text_color(rgb(crate::theme::ui().muted)).child(why.clone()));
                 } else {
@@ -742,7 +774,20 @@ impl Render for PreviewPanel {
                     .flex()
                     .flex_col()
                     .child(bar)
-                    .child(div().flex_1().min_h_0().child(Editor::new(&tt.editor).readonly(!tt.editing).h_full()))
+                    .child(if tt.rendered == Some(true) && !tt.editing {
+                        let text = tt.editor.read(cx).value().to_string();
+                        div()
+                            .id("pv-md-view")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .px_4()
+                            .py_2()
+                            .child(gpui_kit::component::text::TextView::markdown(SharedString::from(format!("md-{i}")), text).selectable(true))
+                            .into_any_element()
+                    } else {
+                        div().flex_1().min_h_0().child(Editor::new(&tt.editor).readonly(!tt.editing).h_full()).into_any_element()
+                    })
                     .into_any_element()
             }
         };
@@ -761,6 +806,16 @@ impl Render for PreviewPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_detection() {
+        for n in ["README.md", "notes.MD", "a.markdown", "doc.Markdown"] {
+            assert!(is_markdown(n), "{n}");
+        }
+        for n in ["md", "x.mdx.txt", "readme", "a.rs"] {
+            assert!(!is_markdown(n), "{n}");
+        }
+    }
 
     #[test]
     fn classify_rules() {
