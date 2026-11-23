@@ -5,6 +5,7 @@
 //! Without -S it shows this computer and the machines in the settings; with -S only that one.
 
 mod config;
+mod fonts;
 mod i18n;
 mod keys;
 mod machines;
@@ -93,6 +94,7 @@ fn main() {
     gpui_kit::application().with_assets(gpui_kit::assets::Assets).run(move |cx| {
         gpui_kit::init(cx);
         gpui_cn::init(cx);
+        fonts::register(cx);
         cx.bind_keys(default_key_bindings());
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
