@@ -55,7 +55,7 @@ fn entry(e: &Value) -> Option<FileEntry> {
         (false, true) => Kind::File,
         (false, false) => Kind::Dir,
     };
-    Some(FileEntry { name: e["name"].as_str()?.to_string(), kind, size: None, modified: None, mode: None })
+    Some(FileEntry { name: e["name"].as_str()?.to_string(), kind, size: None, modified: None, mode: None, uid: None, gid: None, nlink: None })
 }
 
 /// A download reference: "download:" and a random version-4 UUID.
@@ -90,7 +90,7 @@ impl FileSystem for RexFs {
     fn stat(&self, path: &str) -> Result<FileEntry, FsError> {
         let trimmed = path.trim_end_matches('/');
         let (Some(dir), Some(name)) = (parent(trimmed), trimmed.rsplit('/').next()) else {
-            return Ok(FileEntry { name: "/".into(), kind: Kind::Dir, size: None, modified: None, mode: None });
+            return Ok(FileEntry { name: "/".into(), kind: Kind::Dir, size: None, modified: None, mode: None, uid: None, gid: None, nlink: None });
         };
         let v = self.list_dir(&dir, Some(name))?;
         v["entries"].as_array().into_iter().flatten().filter_map(entry).find(|e| e.name == name).ok_or(FsError::NotFound)
@@ -136,6 +136,18 @@ impl FileSystem for RexFs {
     }
     fn writable(&self) -> Result<(), String> {
         Err(READ_ONLY.into())
+    }
+    fn resolve(&self, _path: &str) -> Result<String, FsError> {
+        read_only()
+    }
+    fn write_file(&self, _path: &str, _bytes: &[u8], _create_new: bool) -> Result<(), FsError> {
+        read_only()
+    }
+    fn set_mode(&self, _path: &str, _mode: u32) -> Result<(), FsError> {
+        read_only()
+    }
+    fn replace(&self, _from: &str, _to: &str) -> Result<(), FsError> {
+        read_only()
     }
 }
 

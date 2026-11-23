@@ -5,7 +5,9 @@ pub const VERSION: u8 = 2;
 pub const OPEN: u8 = 3;
 pub const CLOSE: u8 = 4;
 pub const READ: u8 = 5;
+pub const WRITE: u8 = 6;
 pub const LSTAT: u8 = 7;
+pub const SETSTAT: u8 = 9;
 pub const OPENDIR: u8 = 11;
 pub const READDIR: u8 = 12;
 pub const REMOVE: u8 = 13;
@@ -30,6 +32,7 @@ pub const FX_PERMISSION_DENIED: u32 = 3;
 pub const READ_FLAG: u32 = 0x01;
 pub const WRITE_FLAG: u32 = 0x02;
 pub const CREAT: u32 = 0x08;
+pub const TRUNC: u32 = 0x10;
 pub const EXCL: u32 = 0x20;
 
 const ATTR_SIZE: u32 = 0x01;

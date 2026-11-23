@@ -118,6 +118,7 @@ pub fn fs_error_text(e: &FsError) -> String {
         FsError::NotDir => t("Not a folder.", "不是文件夹。").into(),
         FsError::ReadOnly(_) => t("Read-only: files here are reached through Rex, which can only read them.", "只读:这台机器的文件经 Rex 访问,只能读取。").into(),
         FsError::Gone(why) => format!("{}{why}", t("Connection lost: ", "连接断开:")),
+        FsError::Unsupported(why) => format!("{}{why}", t("Not supported here: ", "这里不支持:")),
         FsError::Other(why) => why.clone(),
     }
 }
@@ -667,7 +668,7 @@ mod tests {
     use super::*;
 
     fn e(name: &str, kind: Kind) -> FileEntry {
-        FileEntry { name: name.into(), kind, size: None, modified: None, mode: None }
+        FileEntry { name: name.into(), kind, size: None, modified: None, mode: None, uid: None, gid: None, nlink: None }
     }
 
     #[test]

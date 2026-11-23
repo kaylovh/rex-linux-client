@@ -25,6 +25,10 @@ pub struct FileEntry {
     pub size: Option<u64>,
     pub modified: Option<SystemTime>,
     pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    /// Hard links to the file (None when the source can't tell).
+    pub nlink: Option<u64>,
 }
 
 impl FileEntry {
@@ -53,6 +57,8 @@ pub enum FsError {
     ReadOnly(String),
     /// The connection is gone; the next call tries a new one.
     Gone(String),
+    /// The server can't do this (e.g. rename over a file).
+    Unsupported(String),
     Other(String),
 }
 
@@ -65,6 +71,7 @@ impl fmt::Display for FsError {
             FsError::NotDir => f.write_str("not a directory"),
             FsError::ReadOnly(why) => write!(f, "read-only: {why}"),
             FsError::Gone(why) => write!(f, "connection lost: {why}"),
+            FsError::Unsupported(why) => write!(f, "not supported: {why}"),
             FsError::Other(why) => f.write_str(why),
         }
     }
@@ -91,6 +98,14 @@ pub trait FileSystem: Send + Sync {
     fn remove(&self, path: &str) -> Result<(), FsError>;
     /// Ok if files can be changed, else why not.
     fn writable(&self) -> Result<(), String>;
+    /// The absolute path with every link followed; NotFound when it leads nowhere.
+    fn resolve(&self, path: &str) -> Result<String, FsError>;
+    /// Writes a whole file: a new one (Exists if anything is there) or over an existing one.
+    fn write_file(&self, path: &str, bytes: &[u8], create_new: bool) -> Result<(), FsError>;
+    /// Sets the permission bits.
+    fn set_mode(&self, path: &str, mode: u32) -> Result<(), FsError>;
+    /// Renames `from` to `to` in one step, replacing `to`; Unsupported when the server can't.
+    fn replace(&self, from: &str, to: &str) -> Result<(), FsError>;
 }
 
 /// `dir` + "/" + `name`.

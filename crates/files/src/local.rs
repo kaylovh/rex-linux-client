@@ -2,7 +2,8 @@
 
 use std::fs;
 use std::io::{self, Read};
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write as _;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use crate::{FileEntry, FileSystem, FsError, Kind, Listing};
@@ -37,6 +38,9 @@ fn entry(name: String, path: &Path) -> Result<FileEntry, FsError> {
         size: Some(meta.len()),
         modified: meta.modified().ok(),
         mode: Some(meta.permissions().mode()),
+        uid: Some(meta.uid()),
+        gid: Some(meta.gid()),
+        nlink: Some(meta.nlink()),
     })
 }
 
@@ -78,7 +82,16 @@ impl FileSystem for LocalFs {
         } else {
             Kind::Other
         };
-        Ok(FileEntry { name: name_of(path), kind, size: Some(meta.len()), modified: meta.modified().ok(), mode: Some(meta.permissions().mode()) })
+        Ok(FileEntry {
+            name: name_of(path),
+            kind,
+            size: Some(meta.len()),
+            modified: meta.modified().ok(),
+            mode: Some(meta.permissions().mode()),
+            uid: Some(meta.uid()),
+            gid: Some(meta.gid()),
+            nlink: Some(meta.nlink()),
+        })
     }
 
     fn read(&self, path: &str, max: u64) -> Result<Vec<u8>, FsError> {
@@ -111,6 +124,32 @@ impl FileSystem for LocalFs {
     fn writable(&self) -> Result<(), String> {
         Ok(())
     }
+
+    fn resolve(&self, path: &str) -> Result<String, FsError> {
+        fs::canonicalize(path).map(|p| p.to_string_lossy().into_owned()).map_err(err)
+    }
+
+    fn write_file(&self, path: &str, bytes: &[u8], create_new: bool) -> Result<(), FsError> {
+        let mut o = fs::OpenOptions::new();
+        o.write(true);
+        if create_new {
+            o.create_new(true);
+        } else {
+            o.create(true).truncate(true);
+        }
+        let mut f = o.open(path).map_err(err)?;
+        f.write_all(bytes).map_err(err)?;
+        // On disk before it replaces anything.
+        f.sync_all().map_err(err)
+    }
+
+    fn set_mode(&self, path: &str, mode: u32) -> Result<(), FsError> {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777)).map_err(err)
+    }
+
+    fn replace(&self, from: &str, to: &str) -> Result<(), FsError> {
+        fs::rename(from, to).map_err(err)
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +161,18 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn local_write_conformance() {
+        let root = temp_root("local-write");
+        crate::conformance::run_write(
+            &LocalFs,
+            &root,
+            &|p, b| fs::write(p, b).unwrap(),
+            &|target, p| std::os::unix::fs::symlink(target, p).unwrap(),
+        );
+        assert_eq!(LocalFs.stat(&format!("{root}/big.bin")).unwrap().nlink, Some(1));
     }
 
     #[test]

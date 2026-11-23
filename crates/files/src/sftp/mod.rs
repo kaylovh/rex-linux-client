@@ -215,6 +215,9 @@ fn entry(name: String, a: &Attrs) -> FileEntry {
         size: a.size,
         modified: a.times.map(|(_, m)| UNIX_EPOCH + Duration::from_secs(u64::from(m))),
         mode: a.permissions,
+        uid: a.uid_gid.map(|(u, _)| u),
+        gid: a.uid_gid.map(|(_, g)| g),
+        nlink: None,
     }
 }
 
@@ -420,6 +423,57 @@ impl FileSystem for SftpFs {
     fn writable(&self) -> Result<(), String> {
         Ok(())
     }
+
+    fn resolve(&self, path: &str) -> Result<String, FsError> {
+        // The server's realpath follows every link and fails for a missing target.
+        self.with(|c| {
+            c.attrs(wire::STAT, path)?;
+            c.realpath(path)
+        })
+    }
+
+    fn write_file(&self, path: &str, bytes: &[u8], create_new: bool) -> Result<(), FsError> {
+        self.with(|c| {
+            let flags = wire::WRITE_FLAG | wire::CREAT | if create_new { wire::EXCL } else { wire::TRUNC };
+            let h = match c.handle(wire::OPEN, |o| o.str(path).u32(flags).attrs(&Attrs::default())) {
+                Ok(h) => h,
+                Err(e) if create_new => return Err(exists_or(c, path, e)),
+                Err(e) => return Err(e),
+            };
+            let mut offset = 0usize;
+            let result = loop {
+                if offset >= bytes.len() {
+                    break Ok(());
+                }
+                let end = (offset + CHUNK as usize).min(bytes.len());
+                let chunk = &bytes[offset..end];
+                let at = offset as u64;
+                if let Err(e) = c.simple(wire::WRITE, |o| o.bytes(&h).u64(at).bytes(chunk)) {
+                    break Err(e);
+                }
+                offset = end;
+            };
+            // CLOSE flushes on the server; its status counts.
+            let closed = c.simple(wire::CLOSE, |o| o.bytes(&h));
+            result.and(closed)
+        })
+        .map_err(exists_err)
+    }
+
+    fn set_mode(&self, path: &str, mode: u32) -> Result<(), FsError> {
+        let a = Attrs { permissions: Some(mode & 0o7777), ..Default::default() };
+        self.with(|c| c.simple(wire::SETSTAT, |o| o.str(path).attrs(&a)))
+    }
+
+    fn replace(&self, from: &str, to: &str) -> Result<(), FsError> {
+        self.with(|c| {
+            if !c.posix_rename {
+                return Err(Fail::Status(u32::MAX - 2, "rename over a file".into()));
+            }
+            c.simple(wire::EXTENDED, |o| o.str("posix-rename@openssh.com").str(from).str(to))
+        })
+        .map_err(|e| if e == FsError::Other("rename over a file".into()) { FsError::Unsupported("rename over a file".into()) } else { e })
+    }
 }
 
 /// Our own marker statuses: u32::MAX "exists", u32::MAX - 1 "not a directory".
@@ -458,6 +512,19 @@ mod tests {
         let Some(argv) = server_argv(&root) else { return };
         let fs = SftpFs::spawn(argv).unwrap();
         crate::conformance::run(
+            &fs,
+            &root,
+            &|p, b| std::fs::write(p, b).unwrap(),
+            &|target, p| std::os::unix::fs::symlink(target, p).unwrap(),
+        );
+    }
+
+    #[test]
+    fn sftp_write_conformance() {
+        let root = temp_root("write");
+        let Some(argv) = server_argv(&root) else { return };
+        let fs = SftpFs::spawn(argv).unwrap();
+        crate::conformance::run_write(
             &fs,
             &root,
             &|p, b| std::fs::write(p, b).unwrap(),
