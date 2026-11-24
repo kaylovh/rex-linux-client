@@ -30,13 +30,55 @@ pub struct PanelState {
     pub size: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Docks {
     pub panels: Vec<PanelState>,
 }
 
+/// Read leniently: an entry this build doesn't know (a newer panel, a bad side) is skipped,
+/// a missing field takes the panel's default.
+impl<'de> Deserialize<'de> for Docks {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            panels: Vec<serde_json::Value>,
+        }
+        #[derive(Deserialize)]
+        struct Entry {
+            panel: Panel,
+            side: Option<Side>,
+            open: Option<bool>,
+            size: Option<f32>,
+        }
+        let raw = Raw::deserialize(d)?;
+        let panels = raw
+            .panels
+            .into_iter()
+            .filter_map(|v| serde_json::from_value::<Entry>(v).ok())
+            .map(|e| {
+                let def = Docks::default().get(e.panel);
+                PanelState { panel: e.panel, side: e.side.unwrap_or(def.side), open: e.open.unwrap_or(def.open), size: e.size.unwrap_or(f32::NAN) }
+            })
+            .collect();
+        Ok(Docks { panels })
+    }
+}
+
 pub const MIN_SIZE: f32 = 120.0;
+/// What the terminals keep at least, beside the side docks.
+pub const MIN_CENTER: f32 = 320.0;
+
+/// The side docks' widths, scaled down together when they'd leave the terminals less than
+/// MIN_CENTER of `window`.
+pub fn fit_widths(widths: &[f32], window: f32) -> Vec<f32> {
+    let sum: f32 = widths.iter().sum();
+    let room = (window - MIN_CENTER).max(0.0);
+    if sum <= room || sum <= 0.0 {
+        return widths.to_vec();
+    }
+    widths.iter().map(|w| w * room / sum).collect()
+}
 pub const MAX_SIZE: f32 = 1600.0;
 
 impl Default for Docks {
@@ -119,6 +161,14 @@ impl Docks {
         self.slot(p).size = if size.is_finite() { size.clamp(MIN_SIZE, MAX_SIZE) } else { Docks::default().get(p).size };
     }
 
+    /// As the app starts: the preview shows only when files are to be restored into it.
+    pub fn on_start(mut self, has_previews: bool) -> Self {
+        if !has_previews {
+            self.set_open(Panel::Preview, false);
+        }
+        self
+    }
+
     /// Repairs a state file: every panel once, sizes in range.
     pub fn normalized(self) -> Self {
         let mut out = Docks { panels: Vec::new() };
@@ -141,6 +191,42 @@ impl Docks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn widths_leave_room_for_the_terminals() {
+        // Enough room: unchanged.
+        assert_eq!(fit_widths(&[220.0, 300.0], 1600.0), vec![220.0, 300.0]);
+        // A laptop window with a state from a big monitor: scaled to leave MIN_CENTER.
+        let w = fit_widths(&[600.0, 900.0, 500.0], 1200.0);
+        let sum: f32 = w.iter().sum();
+        assert!((sum - (1200.0 - MIN_CENTER)).abs() < 0.5, "{w:?}");
+        assert!(w[1] > w[0] && w[0] > w[2]);
+        // A tiny window: nothing negative.
+        assert!(fit_widths(&[300.0], 100.0).iter().all(|x| *x >= 0.0));
+    }
+
+    #[test]
+    fn preview_opens_only_with_files_to_show() {
+        let mut d = Docks::default();
+        d.set_open(Panel::Preview, true);
+        assert!(!d.clone().on_start(false).is_open(Panel::Preview));
+        assert!(d.on_start(true).is_open(Panel::Preview));
+    }
+
+    #[test]
+    fn unknown_entries_are_skipped() {
+        let json = r#"{"panels": [
+            {"panel": "sessions", "side": "right", "open": false, "size": 250},
+            {"panel": "minimap", "side": "left", "open": true, "size": 100},
+            {"panel": "files", "side": "left"}
+        ]}"#;
+        let d: Docks = serde_json::from_str(json).unwrap();
+        let d = d.normalized();
+        assert_eq!(d.get(Panel::Sessions).side, Side::Right);
+        assert_eq!(d.get(Panel::Files).side, Side::Left);
+        assert_eq!(d.get(Panel::Files).size, Docks::default().get(Panel::Files).size);
+        assert_eq!(d.panels.len(), 4);
+    }
 
     #[test]
     fn defaults() {

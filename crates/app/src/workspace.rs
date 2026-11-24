@@ -305,7 +305,12 @@ impl Workspace {
     pub fn new(init: Init, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let tabs = cx.new(|_| TabsState::new([]));
         let st = &init.state;
-        let docks = st.docks.clone().map(Docks::normalized).unwrap_or_else(|| Docks::from_old(st.sidebar_open, st.sidebar_width, st.files.open));
+        let docks = st
+            .docks
+            .clone()
+            .map(Docks::normalized)
+            .unwrap_or_else(|| Docks::from_old(st.sidebar_open, st.sidebar_width, st.files.open))
+            .on_start(!st.previews.is_empty());
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let this = cx.weak_entity();
@@ -2834,7 +2839,7 @@ impl Workspace {
     }
 
     /// The open panels of one side, each with a drag handle on its inner edge.
-    fn render_dock(&self, side: Side, cx: &mut Context<Self>) -> Option<Div> {
+    fn render_dock(&self, side: Side, widths: &[f32], cx: &mut Context<Self>) -> Option<Div> {
         let shown = self.docks.shown(side);
         if shown.is_empty() {
             return None;
@@ -2848,12 +2853,13 @@ impl Workspace {
         for (i, s) in shown.iter().enumerate() {
             let p = s.panel;
             let mut cell = div().relative().h_full().min_w_0().overflow_hidden();
+            let width = widths.get(i).copied().unwrap_or(s.size);
             cell = match side {
-                Side::Left => cell.flex_none().w(px(s.size)).border_r_1().border_color(rgb(ui.border)),
-                Side::Right => cell.flex_none().w(px(s.size)).border_l_1().border_color(rgb(ui.border)),
+                Side::Left => cell.flex_none().w(px(width)).border_r_1().border_color(rgb(ui.border)),
+                Side::Right => cell.flex_none().w(px(width)).border_l_1().border_color(rgb(ui.border)),
                 Side::Bottom => cell.flex_1().when(i > 0, |d| d.border_l_1().border_color(rgb(ui.border))),
             };
-            let size = s.size;
+            let size = if side == Side::Bottom { s.size } else { width };
             let handle = div()
                 .id(SharedString::from(format!("dock-handle-{p:?}")))
                 .absolute()
@@ -2946,6 +2952,50 @@ impl Workspace {
         bar
     }
 
+    /// While a dock edge is dragged: a layer over the whole window that takes the pointer, so
+    /// nothing under it (the handle, a pane) swallows the move or the release.
+    fn dock_drag_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let (p, ..) = self.dock_drag?;
+        let side = self.docks.get(p).side;
+        let finish = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            if this.dock_drag.take().is_some() {
+                this.save_state(window, cx);
+                cx.notify();
+            }
+        };
+        let layer = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .occlude()
+            .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, window, cx| {
+                let Some((p, start, size)) = this.dock_drag else { return };
+                // The button came up somewhere we didn't hear it (outside the window).
+                if e.pressed_button != Some(MouseButton::Left) {
+                    finish(this, window, cx);
+                    return;
+                }
+                let side = this.docks.get(p).side;
+                let (x, y) = (f32::from(e.position.x), f32::from(e.position.y));
+                let next = match side {
+                    Side::Left => size + (x - start),
+                    Side::Right => size - (x - start),
+                    Side::Bottom => size - (y - start),
+                };
+                if side == Side::Bottom {
+                    for q in this.docks.on(Side::Bottom) {
+                        this.docks.resize(q, next);
+                    }
+                } else {
+                    this.docks.resize(p, next);
+                }
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, window, cx| finish(this, window, cx)));
+        Some(if side == Side::Bottom { layer.cursor_row_resize() } else { layer.cursor_col_resize() })
+    }
+
     /// The menu a right-click on a status bar toggle opens.
     fn render_dock_menu(&self, cx: &mut Context<Self>) -> Option<Div> {
         let p = self.dock_menu?;
@@ -3003,8 +3053,13 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_preview_dock(cx);
+        // The side docks share what the terminals don't need.
+        let (left, right) = (self.docks.shown(Side::Left), self.docks.shown(Side::Right));
+        let all: Vec<f32> = left.iter().chain(&right).map(|p| p.size).collect();
+        let fitted = crate::dock::fit_widths(&all, f32::from(window.viewport_size().width));
+        let (lw, rw) = fitted.split_at(left.len());
         let prefix = self.prefix.then(|| t("Ctrl-b … (press a key: c new tab, % split, z zoom, : palette)", "Ctrl-b …(再按一个键:c 新 tab、% 分屏、z 放大、: 命令面板)"));
         let conn = self.shown_machine().and_then(|m| m.conn.text().map(|s| format!("{}: {s}", m.spec.name)));
         let status = status_line(prefix, self.banner.as_deref(), conn.as_deref(), &self.notices);
@@ -3026,8 +3081,8 @@ impl Render for Workspace {
                     .child(self.render_toolbar(cx)),
             )
             .child(self.render_panes(cx))
-            .children(self.render_dock(Side::Bottom, cx));
-        let body = div().flex_1().min_h_0().w_full().flex().children(self.render_dock(Side::Left, cx)).child(center).children(self.render_dock(Side::Right, cx));
+            .children(self.render_dock(Side::Bottom, &[], cx));
+        let body = div().flex_1().min_h_0().w_full().flex().children(self.render_dock(Side::Left, lw, cx)).child(center).children(self.render_dock(Side::Right, rw, cx));
         div()
             .size_full()
             .relative()
@@ -3036,32 +3091,6 @@ impl Render for Workspace {
             .bg(rgb(ui.background))
             .text_color(rgb(ui.text))
             .track_focus(&self.focus)
-            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
-                let Some((p, start, size)) = this.dock_drag else { return };
-                let side = this.docks.get(p).side;
-                let (x, y) = (f32::from(e.position.x), f32::from(e.position.y));
-                let next = match side {
-                    Side::Left => size + (x - start),
-                    Side::Right => size - (x - start),
-                    Side::Bottom => size - (y - start),
-                };
-                if side == Side::Bottom {
-                    for q in this.docks.on(Side::Bottom) {
-                        this.docks.resize(q, next);
-                    }
-                } else {
-                    this.docks.resize(p, next);
-                }
-                cx.notify();
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    if this.dock_drag.take().is_some() {
-                        this.save_state(window, cx);
-                    }
-                }),
-            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -3073,6 +3102,7 @@ impl Render for Workspace {
             .child(body)
             .child(self.render_status_bar(status, cx))
             .children(self.render_dock_menu(cx))
+            .children(self.dock_drag_overlay(cx))
             .children(self.drag_overlay(cx))
             .children(self.render_modal(cx))
     }

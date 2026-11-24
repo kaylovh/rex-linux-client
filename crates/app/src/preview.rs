@@ -79,6 +79,14 @@ pub fn classify(name: &str, bytes: &[u8], size: u64) -> PreviewKind {
 }
 
 /// The highlighter for a file name, if one fits.
+/// Larger Markdown files open as source (the rendered view lays out the whole document).
+pub const MD_RENDER_MAX: usize = 512 * 1024;
+
+/// Whether a text tab has a rendered view, and whether it starts in it.
+pub fn markdown_view(language: Option<&str>, len: usize) -> Option<bool> {
+    (language == Some("markdown")).then_some(len <= MD_RENDER_MAX)
+}
+
 /// Shown rendered (the source is a click away, editing is always the text).
 pub fn is_markdown(name: &str) -> bool {
     name.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && (ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")))
@@ -651,7 +659,7 @@ fn text_tab(
             cx.notify();
         }
     });
-    let rendered = (language == Some("markdown")).then_some(true);
+    let rendered = markdown_view(language, lf.len());
     TextTab { editor, note, block, editing: false, dirty: false, base, eol, saved: lf, saving: false, message: None, rendered, _sub: sub }
 }
 
@@ -777,7 +785,7 @@ impl Render for PreviewPanel {
                     .child(if tt.rendered == Some(true) && !tt.editing {
                         let text = tt.editor.read(cx).value().to_string();
                         div()
-                            .id("pv-md-view")
+                            .id(SharedString::from(format!("pv-md-view-{i}")))
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
@@ -806,6 +814,13 @@ impl Render for PreviewPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn big_markdown_opens_as_source() {
+        assert_eq!(markdown_view(Some("markdown"), 10), Some(true));
+        assert_eq!(markdown_view(Some("markdown"), MD_RENDER_MAX + 1), Some(false));
+        assert_eq!(markdown_view(Some("rust"), 10), None);
+    }
 
     #[test]
     fn markdown_detection() {

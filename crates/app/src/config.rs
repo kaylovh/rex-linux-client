@@ -85,7 +85,8 @@ pub struct WorkspaceState {
     pub window_size: Option<(f32, f32)>,
     pub files: FilesState,
     pub previews: Vec<SavedPreview>,
-    /// Where the panels sit; None in a state from before docks.
+    /// Where the panels sit; None in a state from before docks (or one this build can't read).
+    #[serde(deserialize_with = "lenient_docks")]
     pub docks: Option<crate::dock::Docks>,
 }
 
@@ -98,6 +99,12 @@ impl Default for FontSettings {
         };
         Self { family: None, size: None, fallbacks: fallbacks.iter().map(|s| s.to_string()).collect() }
     }
+}
+
+/// A `docks` value that can't be read is dropped, not the whole state.
+fn lenient_docks<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<crate::dock::Docks>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).ok())
 }
 
 impl Default for WorkspaceState {
@@ -287,6 +294,16 @@ mod tests {
         let d = tmp("badstate");
         fs::write(d.join("state.json"), "nonsense").unwrap();
         assert_eq!(load_state(&d), WorkspaceState::default());
+    }
+
+    #[test]
+    fn a_bad_docks_entry_keeps_the_rest_of_the_state() {
+        let json = r#"{"machine": "m:dev", "session": "s1", "docks": {"panels": [{"panel": "minimap", "side": "up"}]}, "files": {"open": true}}"#;
+        let s: WorkspaceState = serde_json::from_str(json).unwrap();
+        assert_eq!(s.machine.as_deref(), Some("m:dev"));
+        assert!(s.files.open);
+        let s: WorkspaceState = serde_json::from_str(r#"{"machine": "m", "docks": 42}"#).unwrap();
+        assert_eq!((s.machine.as_deref(), s.docks), (Some("m"), None));
     }
 
     #[test]
