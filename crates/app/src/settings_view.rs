@@ -72,7 +72,7 @@ pub struct SettingsView {
     shown_hosts: Vec<ShownHosts>,
     downloads: Entity<InputState>,
     theme: Option<String>,
-    icon: Option<String>,
+    icon: Entity<InputState>,
     config_dir: Option<std::path::PathBuf>,
 }
 
@@ -105,7 +105,7 @@ impl SettingsView {
             shown_hosts: settings.shown_hosts.clone(),
             downloads: input(settings.download_dir.clone().unwrap_or_default(), "~/Downloads", window, cx),
             theme: settings.theme.clone(),
-            icon: settings.icon.clone(),
+            icon: input(settings.icon.clone().unwrap_or_default(), t("rexa's icon (PNG or SVG file)", "rexa 默认图标(PNG 或 SVG 文件)"), window, cx),
             config_dir: crate::config::config_dir(|k| std::env::var(k).ok()),
         }
     }
@@ -131,8 +131,8 @@ impl SettingsView {
         if let Some(dir) = dir {
             col = col.child(
                 div().flex().items_center().gap_2().text_xs().text_color(gpui_kit::rgb(crate::theme::ui().muted))
-                    .child(format!("{} {}", t("Your own themes: JSON files in", "自定义主题:放在此目录的 JSON 文件"), dir.display()))
-                    .child(Button::new("themes-open").ghost().size(gpui_cn::ButtonSize::Xs).label(t("Open folder", "打开目录")).on_click(move |_, _, cx| {
+                    .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(format!("{} {}", t("Your own themes: JSON files in", "自定义主题:此目录下的 JSON 文件"), dir.display())))
+                    .child(Button::new("themes-open").flex_none().ghost().size(gpui_cn::ButtonSize::Xs).label(t("Open folder", "打开目录")).on_click(move |_, _, cx| {
                         let _ = std::fs::create_dir_all(&dir);
                         crate::theme::write_example(&dir);
                         cx.open_url(&format!("file://{}", dir.display()));
@@ -185,7 +185,7 @@ impl SettingsView {
         let read = |e: &Entity<InputState>, cx: &Context<Self>| e.read(cx).value().to_string();
         match parse_font(&read(&self.family, cx), &read(&self.size, cx), &read(&self.fallbacks, cx)) {
             Ok(font) => {
-                let s = Settings { language: self.language, machines: self.machines.clone(), font, shown_hosts: self.shown_hosts.clone(), download_dir: self.download_value(cx), theme: self.theme.clone(), icon: self.icon.clone() };
+                let s = Settings { language: self.language, machines: self.machines.clone(), font, shown_hosts: self.shown_hosts.clone(), download_dir: self.download_value(cx), theme: self.theme.clone(), icon: Some(self.icon.read(cx).value().trim().to_string()).filter(|s| !s.is_empty()) };
                 self.error = None;
                 cx.emit(SettingsEvent::Save(s));
             }
@@ -284,6 +284,31 @@ impl Render for SettingsView {
             }))
             .child(Self::section(t("Theme", "主题")))
             .child(self.render_themes(cx))
+            .child(Self::section(t("App icon", "程序图标")))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().flex_1().child(field(t("File", "文件"), &self.icon)))
+                    .child(Button::new("icon-browse").size(gpui_cn::ButtonSize::Xs).label(t("Browse…", "浏览…")).on_click(cx.listener(|this, _, window, cx| {
+                        let picked = cx.prompt_for_paths(gpui_kit::PathPromptOptions { files: true, directories: false, multiple: false, prompt: None });
+                        let icon = this.icon.clone();
+                        window
+                            .spawn(cx, async move |cx| {
+                                if let Ok(Ok(Some(mut paths))) = picked.await
+                                    && let Some(p) = paths.pop()
+                                {
+                                    let _ = cx.update(|window, cx| icon.update(cx, |i, cx| i.set_value(p.to_string_lossy().into_owned(), window, cx)));
+                                }
+                            })
+                            .detach();
+                    }))),
+            )
+            .child(div().text_xs().text_color(gpui_kit::rgb(crate::theme::ui().muted)).child(t(
+                "The taskbar shows a new icon after the app restarts.",
+                "任务栏里的图标在程序重启后更新。",
+            )))
             .child(Self::section(t("Downloads", "下载")))
             .child(field(t("Folder", "目录"), &self.downloads))
             .child(Self::section(t("Terminal font", "终端字体")))

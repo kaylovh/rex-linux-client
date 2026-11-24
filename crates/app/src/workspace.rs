@@ -2227,6 +2227,15 @@ impl Workspace {
         crate::i18n::set_language(s.language);
         let font_changed = s.font != self.settings.font;
         let theme_changed = s.theme != self.settings.theme;
+        #[cfg(target_os = "linux")]
+        if s.icon != self.settings.icon
+            && let (Some(home), Ok(exe)) = (crate::desktop::data_home(|k| std::env::var(k).ok()), std::env::current_exe())
+        {
+            let problems = crate::desktop::install(&home, &exe, s.icon.as_deref().map(std::path::Path::new));
+            if let Some(e) = problems.first() {
+                self.banner = Some(format!("{} {e}", t("The app icon can't be used:", "程序图标无法使用:")));
+            }
+        }
         self.settings = s;
         if theme_changed {
             let (all, _) = crate::theme::load_all(self.config.as_deref());

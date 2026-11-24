@@ -5,6 +5,7 @@
 //! Without -S it shows this computer and the machines in the settings; with -S only that one.
 
 mod config;
+mod desktop;
 mod dock;
 mod file_panel;
 mod fonts;
@@ -84,6 +85,13 @@ fn main() {
                 t("Using defaults; saving the settings replaces it and keeps the old one as settings.json.bak.", "暂用默认设置;在设置里保存会替换它,旧文件留作 settings.json.bak。")
             ),
         );
+    }
+    // The launcher entry and icon (the window's icon on Linux comes from them).
+    #[cfg(target_os = "linux")]
+    if let (Some(home), Ok(exe)) = (desktop::data_home(|k| std::env::var(k).ok()), std::env::current_exe()) {
+        for e in desktop::install(&home, &exe, settings.icon.as_deref().map(std::path::Path::new)) {
+            notices.push(format!("{} {e}", t("The app icon can't be used:", "程序图标无法使用:")));
+        }
     }
     let (themes, theme_errors) = theme::load_all(dir.as_deref());
     for e in &theme_errors {
